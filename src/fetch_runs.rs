@@ -4,8 +4,8 @@
 //! Design context: bd issue drip-15n.9.5. The issue's own motivation is
 //! debugging dedup behavior -- confirming why a given post did or didn't
 //! show up in a digest -- so a fetch run is recorded for EVERY outcome,
-//! including `--dry-run` runs and runs where dedup/`--min-score` filtered
-//! everything out to zero new posts. A `--dry-run` is exactly the tool
+//! including `--dry-run` runs and runs where dedup filtered everything out
+//! to zero new posts. A `--dry-run` is exactly the tool
 //! someone reaches for to debug dedup without committing writes, and a
 //! zero-result run is itself useful debugging signal ("did the fetch fail,
 //! or did dedup correctly suppress everything?").
@@ -13,11 +13,10 @@
 //! This does not conflict with `--dry-run`'s "no real writes" contract:
 //! precedent already exists in this codebase for benign bookkeeping writes
 //! during `--dry-run` (`settings::load` seeds missing settings rows
-//! unconditionally; `sources::upsert_reddit_source` already runs
-//! unconditionally too, via `filter_fetched_posts`, called before the
-//! `--dry-run` branch in `src/main.rs`). Recording fetch history is the same
-//! category of write -- it never touches the vault, the journal, or
-//! `seen_items` (dedup state), so it doesn't change what a later real fetch
+//! unconditionally, called before the `--dry-run` branch in `src/main.rs`).
+//! Recording fetch history is the same category of write -- it never
+//! touches the vault, the journal, or `seen_items` (dedup state), so it
+//! doesn't change what a later real fetch
 //! would do.
 //!
 //! `digest_note_path` is `None`/NULL specifically when no file was actually
@@ -34,8 +33,8 @@ use rusqlite::{params, Connection};
 /// row is never left without its source breakdown rows.
 ///
 /// `digest_note_path` must be `None` whenever no file was actually written
-/// (a `--dry-run` fetch, or a fetch where nothing new survived
-/// min-score/dedup filtering) and `Some(path)` only on the real write path.
+/// (a `--dry-run` fetch, or a fetch where nothing new survived dedup
+/// filtering) and `Some(path)` only on the real write path.
 /// `post_count` is the post-dedup count -- how many new items actually ended
 /// up in (or, for `--dry-run`, would end up in) the digest, not the raw
 /// fetch count. `started_at` is left to the table's own default.

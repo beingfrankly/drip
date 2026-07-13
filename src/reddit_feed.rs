@@ -4,11 +4,12 @@
 //! the same shape as [`crate::youtube::channel_feed_url`].
 //!
 //! Design context: bd issue drip-khu. Reddit's OAuth2 `client_credentials`
-//! grant (see [`crate::reddit::RedditClient`]) stopped being self-service as
-//! of 2026 -- new tokens now require manual "Responsible Builder Policy"
-//! approval, which isn't a fit for `drip`'s "just works with an app id/
-//! secret" model. We looked at Reddit's Devvit platform as an alternative
-//! and ruled it out: it's an in-platform app framework (apps hosted BY
+//! grant (previously used by drip's own OAuth-based Reddit client, since
+//! removed) stopped being self-service as of 2026 -- new tokens now require
+//! manual "Responsible Builder Policy" approval, which isn't a fit for
+//! `drip`'s "just works with an app id/secret" model. We looked at Reddit's
+//! Devvit platform as an alternative and ruled it out: it's an in-platform
+//! app framework (apps hosted BY
 //! Reddit, scoped to communities that install them), not usable as a
 //! generic personal-tool API. Instead, we confirmed LIVE that Reddit's old
 //! unauthenticated per-subreddit RSS/Atom endpoints still work:
@@ -16,7 +17,7 @@
 //! - `https://www.reddit.com/r/{sub}/{sort}/.rss` -- a plain listing feed,
 //!   for `sort` in hot/new/top/rising/controversial, with `top`/
 //!   `controversial` additionally taking a `?t={time}` window (mirroring
-//!   `crate::reddit::RedditClient::fetch_listing`'s OAuth equivalent
+//!   the time-window behavior of the removed OAuth client's listing fetch
 //!   exactly).
 //! - `https://www.reddit.com/r/{sub}/search/.rss?q={query}&restrict_sr=1&sort={sort}`
 //!   -- a genuine free-text Reddit search scoped to the subreddit (`restrict_sr=1`),
@@ -25,8 +26,8 @@
 //!
 //! Both endpoints returned real, rate-limited-but-not-hard-blocked responses
 //! during that investigation -- Reddit sends real `x-ratelimit-*` headers on
-//! them, same courtesy signal the OAuth API sends, just enforced per-IP
-//! instead of per-token.
+//! them, the same courtesy signal the old OAuth API used to send, just
+//! enforced per-IP instead of per-token.
 //!
 //! Because these are just RSS/Atom feeds like any other, fetching one needs
 //! no Reddit-specific client at all: once [`subreddit_feed_url`] below has
@@ -51,7 +52,7 @@ use crate::types::{Sort, TimeFilter};
 ///   `https://www.reddit.com/r/{subreddit}/{sort}/.rss`, with `?t={time}`
 ///   appended only when `sort` is [`Sort::Top`] or [`Sort::Controversial`]
 ///   *and* `time` is `Some` (any other sort silently drops a given `time`,
-///   matching `RedditClient::fetch_listing`'s behavior exactly).
+///   matching the removed OAuth client's listing-fetch behavior exactly).
 /// - `search: Some(query)` -- a subreddit-scoped search feed:
 ///   `https://www.reddit.com/r/{subreddit}/search/.rss?q={query}&restrict_sr=1&sort={sort}`,
 ///   with `t={time}` appended when `sort` is [`Sort::Top`] and `time` is

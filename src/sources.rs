@@ -3,10 +3,12 @@
 //! labeled-source CRUD backing `drip source add/list/remove`.
 //!
 //! Design context: bd issue drip-15n.9.3 introduced [`upsert_reddit_source`]
-//! as the building block `drip profile add` uses to make sure every
-//! subreddit it references has a `sources` row before linking it into
-//! `profile_sources`. bd issue drip-15n.9.6 generalizes that into
-//! [`upsert_source`] (any `kind`, optionally labeled via `display_name`) plus
+//! as the building block the (since-removed, bd issue drip-1uk.2) `drip
+//! profile add` command used to make sure every subreddit it referenced had
+//! a `sources` row before linking it into `profile_sources`; it's now
+//! `#[cfg(test)]`-only, kept as a test fixture builder (bd issue drip-1uk.9).
+//! bd issue drip-15n.9.6 generalizes the general case into [`upsert_source`]
+//! (any `kind`, optionally labeled via `display_name`) plus
 //! [`find_by_label`]/[`list`]/[`remove_by_label`] for the `drip source`
 //! command family.
 
@@ -90,10 +92,17 @@ fn map_label_conflict(err: rusqlite::Error, display_name: Option<&str>) -> anyho
 ///
 /// Idempotent: calling this twice with the same `subreddit` returns the same
 /// id both times rather than creating a duplicate row. A thin wrapper around
-/// [`upsert_source`] with no label -- Reddit sources created this way (via
-/// `-s`/`drip profile add`) are unlabeled and don't show up in `drip source
-/// list`, which is specifically for the sources this module's labeled-CRUD
-/// functions manage.
+/// [`upsert_source`] with no label -- Reddit sources created this way were
+/// unlabeled and didn't show up in `drip source list`, which is specifically
+/// for the sources this module's labeled-CRUD functions manage.
+///
+/// Test-only (bd issue drip-1uk.9): its only production callers were the
+/// OAuth `-s/--subreddit` fetch path and `drip profile add`, both removed
+/// (bd issue drip-1uk.1/.2) now that drip is RSS-only for Reddit. Kept
+/// `#[cfg(test)]` as a convenience fixture builder for
+/// `dedup.rs`/`fetch_runs.rs`/this module's own tests, which need a `sources`
+/// row to exist without caring about labeling.
+#[cfg(test)]
 pub fn upsert_reddit_source(conn: &Connection, subreddit: &str) -> Result<i64> {
     upsert_source(conn, "reddit", subreddit, None)
 }
@@ -122,10 +131,10 @@ pub fn find_by_label(conn: &Connection, label: &str) -> Result<Option<SourceRow>
 }
 
 /// List every labeled source (`display_name IS NOT NULL`), ordered by
-/// `display_name`. Intentionally excludes unlabeled sources -- those are
-/// Reddit sources created implicitly via `-s`/`drip profile add`, which have
-/// their own management surface (`drip profile list`); `drip source list` is
-/// specifically for the sources this module's labeled-CRUD functions manage.
+/// `display_name`. Intentionally excludes unlabeled sources -- those were
+/// Reddit sources created implicitly via the now-removed `-s`/`drip profile
+/// add` (bd issue drip-1uk.1/.2); `drip source list` is specifically for the
+/// sources this module's labeled-CRUD functions manage.
 pub fn list(conn: &Connection) -> Result<Vec<SourceRow>> {
     let mut stmt = conn
         .prepare(

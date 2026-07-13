@@ -29,11 +29,6 @@ pub enum Commands {
         #[command(subcommand)]
         action: ConfigAction,
     },
-    /// Manage saved fetch profiles
-    Profile {
-        #[command(subcommand)]
-        action: ProfileAction,
-    },
     /// Manage saved non-Reddit sources (RSS feeds, etc.)
     Source {
         #[command(subcommand)]
@@ -43,20 +38,24 @@ pub enum Commands {
 
 #[derive(Debug, Clone, Args)]
 pub struct FetchArgs {
-    /// Subreddit(s) to fetch from. Repeat the flag or pass a comma-separated list.
-    #[arg(short = 's', long = "subreddit", value_delimiter = ',')]
-    pub subreddit: Vec<String>,
-
-    /// Sort order for the fetched posts. Falls back to the saved
-    /// `default_sort` setting when not given.
+    /// Sort label for the digest note's frontmatter/header. Falls back to
+    /// the saved `default_sort` setting when not given. Does NOT filter or
+    /// affect what's fetched -- for a Reddit source, control the actual
+    /// sort at `drip source add --kind reddit --sort` time instead.
     #[arg(long, value_enum)]
     pub sort: Option<Sort>,
 
-    /// Time window filter (only meaningful for top/controversial/search)
+    /// Time window label for the digest note's frontmatter/header. Does NOT
+    /// filter or affect what's fetched -- for a Reddit source, control the
+    /// actual time window at `drip source add --kind reddit --time` time
+    /// instead.
     #[arg(long, value_enum)]
     pub time: Option<TimeFilter>,
 
-    /// Search query
+    /// Query label for the digest note's frontmatter/header. Does NOT
+    /// search or affect what's fetched -- for a Reddit source, control the
+    /// actual search term at `drip source add --kind reddit --search` time
+    /// instead.
     #[arg(short = 'q', long = "query")]
     pub query: Option<String>,
 
@@ -64,14 +63,6 @@ pub struct FetchArgs {
     /// setting when not given.
     #[arg(short = 'n', long = "limit")]
     pub limit: Option<u32>,
-
-    /// Only include posts with at least this score
-    #[arg(long = "min-score")]
-    pub min_score: Option<i64>,
-
-    /// Exclude NSFW items from the digest (default: NSFW items are included)
-    #[arg(long = "no-nsfw")]
-    pub no_nsfw: bool,
 
     /// Override the configured posts folder for this run
     #[arg(long)]
@@ -81,10 +72,6 @@ pub struct FetchArgs {
     /// Falls back to the saved `default_tags` setting when not given.
     #[arg(long = "tag", value_delimiter = ',')]
     pub tag: Vec<String>,
-
-    /// Use a saved profile instead of (or as a base for) the flags above
-    #[arg(long)]
-    pub profile: Option<String>,
 
     /// Skip appending a reference to the daily journal note
     #[arg(long = "no-journal")]
@@ -120,51 +107,6 @@ pub enum ConfigAction {
         /// New value for the setting
         value: String,
     },
-}
-
-#[derive(Debug, Subcommand)]
-pub enum ProfileAction {
-    /// Save a new profile
-    Add(ProfileAddArgs),
-    /// Remove a saved profile
-    Remove {
-        /// Name of the profile to remove
-        #[arg(long)]
-        name: String,
-    },
-    /// List saved profiles
-    List,
-}
-
-#[derive(Debug, Clone, Args)]
-pub struct ProfileAddArgs {
-    /// Name to save this profile under
-    #[arg(long)]
-    pub name: String,
-
-    /// Subreddit(s) this profile fetches from. Repeat the flag or pass a comma-separated list.
-    #[arg(short = 's', long = "subreddit", value_delimiter = ',')]
-    pub subreddit: Vec<String>,
-
-    /// Sort order for this profile
-    #[arg(long, value_enum, default_value_t = Sort::Hot)]
-    pub sort: Sort,
-
-    /// Time window filter (only meaningful for top/controversial/search)
-    #[arg(long, value_enum)]
-    pub time: Option<TimeFilter>,
-
-    /// Search query for this profile
-    #[arg(short = 'q', long = "query")]
-    pub query: Option<String>,
-
-    /// Number of posts this profile fetches
-    #[arg(short = 'n', long = "limit", default_value_t = 10)]
-    pub limit: u32,
-
-    /// Tag(s) this profile applies. Repeat the flag or pass a comma-separated list.
-    #[arg(long = "tag", value_delimiter = ',')]
-    pub tag: Vec<String>,
 }
 
 #[derive(Debug, Subcommand)]

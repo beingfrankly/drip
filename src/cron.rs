@@ -187,13 +187,13 @@ mod tests {
             8,
             0,
             "/path/to/drip",
-            "--profile weekly-rust",
+            "--source weekly-rust",
             "~/.local/log/drip.log",
         );
         assert_eq!(
             line,
             format!(
-                "{MARKER}\n0 8 * * * /path/to/drip fetch --profile weekly-rust >> ~/.local/log/drip.log 2>&1"
+                "{MARKER}\n0 8 * * * /path/to/drip fetch --source weekly-rust >> ~/.local/log/drip.log 2>&1"
             )
         );
     }
@@ -204,7 +204,7 @@ mod tests {
             8,
             0,
             "/path/to/drip",
-            "--profile weekly-rust",
+            "--source weekly-rust",
             "~/.local/log/drip.log",
         );
         let result = upsert_line("", MARKER, &new_block);
@@ -218,7 +218,7 @@ mod tests {
             8,
             0,
             "/path/to/drip",
-            "--profile weekly-rust",
+            "--source weekly-rust",
             "~/.local/log/drip.log",
         );
         let result = upsert_line(existing, MARKER, &new_block);
@@ -235,7 +235,7 @@ mod tests {
             8,
             0,
             "/path/to/drip",
-            "--profile weekly-rust",
+            "--source weekly-rust",
             "~/.local/log/drip.log",
         );
         let existing =
@@ -245,7 +245,7 @@ mod tests {
             9,
             30,
             "/path/to/drip",
-            "-s rust,programming",
+            "--source rust,programming",
             "~/.local/log/drip.log",
         );
         let result = upsert_line(&existing, MARKER, &new_block);
@@ -262,7 +262,7 @@ mod tests {
             8,
             0,
             "/path/to/drip",
-            "--profile weekly-rust",
+            "--source weekly-rust",
             "~/.local/log/drip.log",
         );
         let existing =
@@ -272,7 +272,7 @@ mod tests {
             9,
             30,
             "/path/to/drip",
-            "-s rust,programming",
+            "--source rust,programming",
             "~/.local/log/drip.log",
         );
         let result = upsert_line(&existing, MARKER, &new_block);
@@ -289,7 +289,7 @@ mod tests {
         // line follows it) -- should not panic, should just replace the
         // marker line itself and append the new block after it.
         let existing = format!("# some other cron job\n0 5 * * * /usr/bin/backup.sh\n{MARKER}\n");
-        let new_block = build_line(9, 30, "/path/to/drip", "-s rust", "~/.local/log/drip.log");
+        let new_block = build_line(9, 30, "/path/to/drip", "--source rust", "~/.local/log/drip.log");
         let result = upsert_line(&existing, MARKER, &new_block);
 
         assert_eq!(
@@ -305,7 +305,7 @@ mod tests {
             8,
             0,
             "/path/to/drip",
-            "--profile weekly-rust",
+            "--source weekly-rust",
             "~/.local/log/drip.log",
         );
         let result = upsert_line(existing, MARKER, &new_block);

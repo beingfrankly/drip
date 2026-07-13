@@ -9,7 +9,6 @@ chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 directories = "5"
 feed-rs = "2.4.0"
-keyring = "4"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "native-tls"] }
 rusqlite = { version = "0.31", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }

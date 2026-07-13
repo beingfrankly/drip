@@ -2,9 +2,9 @@
 //! `feed_rs::parser::parse` call, mapped into the normalized [`Item`] shape
 //! shared with Reddit (see `src/item.rs`).
 //!
-//! Design context: bd issue drip-15n.9.6. Unlike [`crate::reddit::
-//! RedditClient`] there's no OAuth token to cache, so a fresh
-//! `reqwest::blocking::Client` per call is fine -- no client struct needed.
+//! Design context: bd issue drip-15n.9.6. There's no token or session state
+//! to cache here, so a fresh `reqwest::blocking::Client` per call is fine --
+//! no client struct needed.
 //! `feed-rs` was chosen (per the issue's own recommendation) because it
 //! handles both RSS 2.0 and Atom via the same `parse` call, so this module
 //! doesn't need to know or care which format a given feed uses.

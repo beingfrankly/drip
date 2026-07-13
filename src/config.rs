@@ -15,8 +15,10 @@ use serde::{Deserialize, Serialize};
 /// `daily_note_format`, `default_sort`, `default_limit`, `default_tags`)
 /// moved to the `settings` table -- see [`crate::settings`] and bd issue
 /// drip-15n.9.8's design note for the full reasoning. `profiles` moved to
-/// the `profiles`/`profile_sources`/`profile_tags` tables -- see
-/// [`crate::profiles`] and bd issue drip-15n.9.3's design note.
+/// the `profiles`/`profile_sources`/`profile_tags` tables (bd issue
+/// drip-15n.9.3's design note) before being removed entirely (bd issue
+/// drip-1uk.2) once Reddit's OAuth path -- the only thing profiles were
+/// ever presets for -- was removed.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     /// Absolute path to the Obsidian vault. Empty until `drip init` sets it.

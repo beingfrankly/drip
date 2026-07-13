@@ -1,6 +1,5 @@
 mod cli;
 mod config;
-mod credentials;
 mod cron;
 mod db;
 mod dedup;
@@ -8,8 +7,6 @@ mod digest;
 mod fetch_runs;
 mod item;
 mod journal;
-mod profiles;
-mod reddit;
 mod reddit_feed;
 mod rss;
 mod settings;
@@ -21,13 +18,11 @@ use std::io::Write;
 
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
-use rusqlite::Connection;
 
-use cli::{Cli, Commands, ConfigAction, FetchArgs, ProfileAction, SourceAction, SourceKind};
+use cli::{Cli, Commands, ConfigAction, FetchArgs, SourceAction, SourceKind};
 use config::Config;
 use digest::{digest_filename, render_digest_note, write_digest_note, DigestRun, SourceGroup};
 use item::Item;
-use reddit::{Post, RedditClient};
 use types::{Sort, TimeFilter};
 
 /// Print `msg` when `verbose` is true; a no-op otherwise. This is the single
@@ -60,16 +55,14 @@ fn main() -> Result<()> {
         Commands::Fetch(args) => handle_fetch(args, &config),
         Commands::Init => handle_init(),
         Commands::Config { action } => handle_config(action, &config),
-        Commands::Profile { action } => handle_profile(action, &config),
         Commands::Source { action } => handle_source(action, &config),
     }
 }
 
-/// Fetch parameters after resolving `--profile` (if any) against the saved
-/// profiles in `config`. See [`resolve_fetch_params`].
+/// Fetch parameters after resolving defaults against `settings`. See
+/// [`resolve_fetch_params`].
 #[derive(Debug, Clone)]
 struct ResolvedFetchParams {
-    subreddit: Vec<String>,
     sort: Sort,
     time: Option<TimeFilter>,
     query: Option<String>,
@@ -77,47 +70,20 @@ struct ResolvedFetchParams {
     tag: Vec<String>,
 }
 
-/// Resolve the effective fetch parameters for `args`, loading them from a
-/// saved profile when appropriate.
+/// Resolve the effective fetch parameters for `args`, falling back to
+/// `settings.default_sort`/`default_limit`/`default_tags` for whichever of
+/// `sort`/`limit`/`tag` weren't given as explicit flags (drip-15n.10). `time`
+/// has no settings-backed default and is passed through as-is.
 ///
-/// - `--profile <name>` with no `-s/--subreddit` given: look up `name` via
-///   [`profiles::find`] and use that profile's subreddits/sort/time/query/
-///   limit/tags. Errors clearly if no such profile exists.
-/// - No `--profile`, or `--profile <name>` together with `-s/--subreddit`
-///   (the latter per drip-15n.8: the profile name is only a label there --
-///   for the digest filename/tags -- explicit flags win and the profile's
-///   own sort/time/query/limit/tags are intentionally NOT applied): falls
-///   back to `settings.default_sort`/`default_limit`/`default_tags` for
-///   whichever of `sort`/`limit`/`tag` weren't given as explicit flags
-///   (drip-15n.10). `time` has no settings-backed default and is passed
-///   through as-is.
+/// Of the fields returned here, only `limit`/`tag` affect what actually gets
+/// fetched/written (see [`truncate_to_limit`] and `DigestRun.tags`);
+/// `sort`/`time`/`query` only label the digest note's own frontmatter/header
+/// (bd issue drip-1uk.10) -- see `FetchArgs`' doc comments in `src/cli.rs`.
 ///
-/// `min_score`/`folder`/`no_journal`/`dry_run`/`verbose` are orthogonal to
-/// this resolution and are read directly from `args` by the caller.
-fn resolve_fetch_params(
-    args: &FetchArgs,
-    conn: &Connection,
-    settings: &settings::Settings,
-) -> Result<ResolvedFetchParams> {
-    if let Some(name) = &args.profile {
-        if args.subreddit.is_empty() {
-            let profile = profiles::find(conn, name)?.with_context(|| {
-                format!("no profile named '{name}' (run `drip profile list` to see saved profiles)")
-            })?;
-
-            return Ok(ResolvedFetchParams {
-                subreddit: profile.subreddits,
-                sort: profile.sort,
-                time: profile.time,
-                query: profile.query,
-                limit: profile.limit,
-                tag: profile.tags,
-            });
-        }
-    }
-
-    Ok(ResolvedFetchParams {
-        subreddit: args.subreddit.clone(),
+/// `folder`/`no_journal`/`dry_run`/`verbose`/`source` are orthogonal to this
+/// resolution and are read directly from `args` by the caller.
+fn resolve_fetch_params(args: &FetchArgs, settings: &settings::Settings) -> ResolvedFetchParams {
+    ResolvedFetchParams {
         sort: args.sort.unwrap_or(settings.default_sort),
         time: args.time,
         query: args.query.clone(),
@@ -127,13 +93,13 @@ fn resolve_fetch_params(
         } else {
             args.tag.clone()
         },
-    })
+    }
 }
 
 /// Deduplicate `items` while preserving first-occurrence order. Used to
-/// guard the `-s/--subreddit` and `--source` lists against exact duplicates
-/// (e.g. `-s rust,rust`) before they drive a fetch loop -- both to avoid a
-/// wasted duplicate network fetch and, more importantly, to avoid two
+/// guard the `--source` list against exact duplicates (e.g. `--source
+/// rust,rust`) before it drives a fetch loop -- both to avoid a wasted
+/// duplicate network fetch and, more importantly, to avoid two
 /// `SourceGroup`s resolving to the same `source_id` later in `handle_fetch`
 /// (see the `source_ids`/`groups` comment there for why that matters).
 fn dedup_preserving_order(items: &[String]) -> Vec<String> {
@@ -145,180 +111,55 @@ fn dedup_preserving_order(items: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// Apply the `--min-score` and `--no-nsfw` filters, then apply per-source
-/// dedup (drip-15n.9.4) against an already-known `source_id`, returning the
-/// surviving items. Source-kind-agnostic -- works the same whether `items`
-/// came from Reddit or RSS.
-///
-/// Order matters: `min_score`/`no_nsfw` are applied BEFORE dedup, and only
-/// the items that survive both ever reach the returned `Vec<Item>` -- so an
-/// item excluded by `--min-score` or `--no-nsfw` is never passed to
-/// `dedup::filter_unseen` and therefore never gets recorded as seen by a
-/// later `dedup::record_seen` call over this function's output. That's what
-/// lets an item whose score later rises above the threshold (or whose NSFW
-/// flag later changes) reappear in a future digest.
-///
-/// Items with `score: None` (every RSS item today) always pass the
-/// min-score filter -- `--min-score` only excludes items that HAVE a score
-/// below the threshold; it has no meaning for a source kind without a score
-/// concept. Similarly, every RSS/Atom item has `nsfw: false` (see
-/// `src/rss.rs`), so `--no-nsfw` only has a real effect on Reddit-origin
-/// items today.
-///
-/// A pure function of its inputs plus the DB (no network), so the
-/// min-score/no-nsfw/dedup interaction is unit-testable without mocking
-/// Reddit.
-fn filter_items(
-    conn: &Connection,
-    source_id: i64,
-    mut items: Vec<Item>,
-    min_score: Option<i64>,
-    no_nsfw: bool,
-) -> Result<Vec<Item>> {
-    if let Some(min_score) = min_score {
-        items.retain(|item| item.score.map_or(true, |s| s >= min_score));
-    }
-
-    if no_nsfw {
-        items.retain(|item| !item.nsfw);
-    }
-
-    dedup::filter_unseen(conn, source_id, items)
-}
-
-/// Convert `posts` into `Item`s, resolve `subreddit`'s `source_id`, and
-/// apply [`filter_items`] (min-score/no-nsfw then dedup), returning both the
-/// resolved `source_id` and the surviving items.
-///
-/// Every item here comes from a Reddit post (via `Item::from`), so `score`
-/// is always `Some` and `filter_items`'s min-score check is equivalent to
-/// filtering on `Post::score` directly (likewise `nsfw` mirrors
-/// `Post::over_18`).
-fn filter_fetched_posts(
-    conn: &Connection,
-    subreddit: &str,
-    posts: Vec<Post>,
-    min_score: Option<i64>,
-    no_nsfw: bool,
-) -> Result<(i64, Vec<Item>)> {
-    let items: Vec<Item> = posts.into_iter().map(Item::from).collect();
-
-    let source_id = sources::upsert_reddit_source(conn, subreddit)?;
-    let items = filter_items(conn, source_id, items, min_score, no_nsfw)?;
-
-    Ok((source_id, items))
+/// Cap a single source's freshly-fetched `items` (before dedup) at
+/// `--limit`/`-n` (falling back to `settings.default_limit`), keeping the
+/// first `limit` entries in feed order and dropping the rest. Applied
+/// per-source, not to the digest as a whole, so `--limit 5` across three
+/// `--source` labels can still produce up to 15 items total.
+fn truncate_to_limit(mut items: Vec<Item>, limit: u32) -> Vec<Item> {
+    items.truncate(limit as usize);
+    items
 }
 
 fn handle_fetch(args: &FetchArgs, config: &Config) -> Result<()> {
     vprintln(args.verbose, format!("parsed fetch args:\n{:#?}", args));
 
     // `posts_folder`/`daily_notes_folder`/`daily_note_format` live in the
-    // `settings` table now, not on `Config` -- see `src/settings.rs`. And
-    // `--profile` lookups are DB-backed now too -- see `src/profiles.rs`.
-    // Open the connection up front so both of those can share it.
+    // `settings` table now, not on `Config` -- see `src/settings.rs`. Open
+    // the connection up front so both of those can share it.
     let conn = db::open(config)?;
     let settings = settings::load(&conn)?;
 
-    let mut resolved = resolve_fetch_params(args, &conn, &settings)?;
+    let resolved = resolve_fetch_params(args, &settings);
     vprintln(
         args.verbose,
         format!("resolved fetch params:\n{:#?}", resolved),
     );
 
-    if resolved.subreddit.is_empty() && args.source.is_empty() {
-        eprintln!("drip fetch: no --subreddit or --source given, nothing to fetch");
+    if args.source.is_empty() {
+        eprintln!("drip fetch: no --source given, nothing to fetch");
         return Ok(());
     }
 
-    // Deduplicate both lists up front, preserving first-occurrence order --
-    // an exact duplicate (e.g. `-s rust,rust`) would otherwise trigger a
-    // wasted duplicate fetch AND produce two `SourceGroup`s that resolve to
-    // the same `source_id`, which crashes `fetch_runs::record`'s
+    // Deduplicate up front, preserving first-occurrence order -- an exact
+    // duplicate (e.g. `--source rust,rust`) would otherwise trigger a wasted
+    // duplicate fetch AND produce two `SourceGroup`s that resolve to the
+    // same `source_id`, which crashes `fetch_runs::record`'s
     // `PRIMARY KEY(fetch_run_id, source_id)` insert further down.
-    resolved.subreddit = dedup_preserving_order(&resolved.subreddit);
     let sources_to_fetch = dedup_preserving_order(&args.source);
 
-    // `groups`/`source_ids` are shared across both source kinds below.
-    // `source_ids` is keyed by `(kind, name)` rather than bare `name` so a
-    // Reddit subreddit and an RSS `--source` label that happen to share the
-    // same string (e.g. both named "rust") resolve to genuinely distinct
-    // keys and never collide -- a bare-`name` key previously let one
-    // silently overwrite the other's `source_id` in this map, corrupting
-    // which source's `seen_items`/`fetch_run_sources` rows the other
-    // group's items got attributed to. Exact duplicates within a single
-    // list (e.g. `-s rust,rust`) are handled separately, by deduplicating
-    // `resolved.subreddit`/`args.source` up front via
-    // `dedup_preserving_order` before either fetch loop runs below.
+    // `groups`/`source_ids` are shared across the fetch loop below.
+    // `source_ids` is keyed by `(kind, name)` rather than bare `name` so
+    // sources of different kinds that happen to share the same label string
+    // resolve to genuinely distinct keys and never collide -- a bare-`name`
+    // key previously let one silently overwrite the other's `source_id` in
+    // this map, corrupting which source's `seen_items`/`fetch_run_sources`
+    // rows the other group's items got attributed to. Exact duplicates
+    // within `args.source` are handled separately, by deduplicating it up
+    // front via `dedup_preserving_order` before the fetch loop runs below.
     let mut groups: Vec<(SourceGroup, Vec<Item>)> = Vec::new();
     let mut source_ids: std::collections::HashMap<(String, String), i64> =
         std::collections::HashMap::new();
-
-    // Reddit credentials are only needed -- and only loaded -- when there's
-    // actually a subreddit to fetch. A `drip fetch --source <label>` run
-    // (RSS only, no `-s`/profile subreddits) must not require Reddit
-    // credentials to be configured at all.
-    if !resolved.subreddit.is_empty() {
-        let mut client = match credentials::load_credentials() {
-            Ok((client_id, client_secret)) => RedditClient::new(client_id, client_secret),
-            Err(err) => {
-                eprintln!("drip fetch: {err}");
-                return Ok(());
-            }
-        };
-
-        let results = client.fetch_many(
-            &resolved.subreddit,
-            resolved.query.as_deref(),
-            resolved.sort,
-            resolved.time,
-            resolved.limit,
-            args.verbose,
-        );
-
-        for (subreddit, result) in results {
-            match result {
-                Ok(posts) => {
-                    // "total" here is the count AFTER min_score but BEFORE
-                    // dedup, so the printed summary distinguishes "filtered
-                    // by score" from "filtered as already seen". Computed
-                    // via a borrow so `posts` can still be moved into
-                    // `filter_fetched_posts` below without duplicating the
-                    // dedup lookup.
-                    let total = match args.min_score {
-                        Some(min_score) => posts.iter().filter(|p| p.score >= min_score).count(),
-                        None => posts.len(),
-                    };
-                    let (source_id, filtered) = filter_fetched_posts(
-                        &conn,
-                        &subreddit,
-                        posts,
-                        args.min_score,
-                        args.no_nsfw,
-                    )?;
-                    let new = filtered.len();
-                    let skipped = total - new;
-
-                    if skipped > 0 {
-                        println!(
-                            "r/{subreddit}: fetched {total} post(s), {new} new ({skipped} already seen)"
-                        );
-                    } else {
-                        println!("r/{subreddit}: fetched {new} post(s)");
-                    }
-
-                    source_ids.insert(("reddit".to_string(), subreddit.clone()), source_id);
-                    groups.push((
-                        SourceGroup {
-                            kind: "reddit".to_string(),
-                            name: subreddit,
-                        },
-                        filtered,
-                    ));
-                }
-                Err(err) => eprintln!("warning: {err}"),
-            }
-        }
-    }
 
     if !sources_to_fetch.is_empty() {
         for label in &sources_to_fetch {
@@ -334,14 +175,10 @@ fn handle_fetch(args: &FetchArgs, config: &Config) -> Result<()> {
                     };
                     match fetch_result {
                         Ok(items) => {
+                            let items = truncate_to_limit(items, resolved.limit);
                             let total = items.len();
-                            let filtered = filter_items(
-                                &conn,
-                                source_row.id,
-                                items,
-                                args.min_score,
-                                args.no_nsfw,
-                            )?;
+                            let filtered =
+                                dedup::filter_unseen(&conn, source_row.id, items)?;
                             let new = filtered.len();
                             let skipped = total - new;
 
@@ -406,7 +243,7 @@ fn handle_fetch(args: &FetchArgs, config: &Config) -> Result<()> {
         query: resolved.query.clone(),
         tags: resolved.tag.clone(),
         items_by_source: groups,
-        profile: args.profile.clone(),
+        profile: None,
         created_at: chrono::Utc::now(),
     };
 
@@ -504,18 +341,10 @@ fn handle_fetch(args: &FetchArgs, config: &Config) -> Result<()> {
     Ok(())
 }
 
-/// Interactive first-run setup wizard: prompts for Reddit credentials and
-/// vault layout, saves credentials to the OS keyring (falling back to a
-/// clear warning if that fails), and writes the resulting `Config` to disk.
+/// Interactive first-run setup wizard: prompts for vault layout and default
+/// fetch settings, and writes the resulting `Config` to disk.
 fn handle_init() -> Result<()> {
     println!("drip init: first-run setup\n");
-    println!(
-        "You'll need a Reddit \"script\" app's client id and secret. If you don't have one \
-         yet, create one at https://www.reddit.com/prefs/apps\n"
-    );
-
-    let client_id = prompt_required("Reddit client id")?;
-    let client_secret = prompt_required("Reddit client secret")?;
 
     let vault_path = prompt_vault_path()?;
 
@@ -541,18 +370,6 @@ fn handle_init() -> Result<()> {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect();
-
-    match credentials::save_credentials(&client_id, &client_secret) {
-        Ok(()) => println!("\nsaved Reddit credentials to the OS keyring."),
-        Err(err) => {
-            eprintln!("\nwarning: {err}");
-            eprintln!(
-                "your answers are still safe: your Reddit client id/secret weren't saved to \
-                 the keyring, but you can set DRIP_REDDIT_CLIENT_ID and \
-                 DRIP_REDDIT_CLIENT_SECRET manually instead. Saving the rest of the config now."
-            );
-        }
-    }
 
     // `posts_folder`/`daily_notes_folder`/`daily_note_format`/`default_sort`/
     // `default_limit`/`default_tags` live in the `settings` table now, not
@@ -613,7 +430,11 @@ fn handle_init() -> Result<()> {
         }
     }
 
-    println!("you're ready -- try `drip fetch -s <subreddit>`");
+    println!(
+        "you're ready -- register a source with `drip source add --kind reddit --url \
+         <subreddit> --name <label>` (or --kind rss/youtube), then try `drip fetch --source \
+         <label>`"
+    );
 
     Ok(())
 }
@@ -646,19 +467,6 @@ fn read_prompt(label: &str, default: Option<&str>) -> Result<Option<String>> {
 /// the default.
 fn prompt_or_default(label: &str, default: &str) -> Result<String> {
     Ok(read_prompt(label, Some(default))?.unwrap_or_else(|| default.to_string()))
-}
-
-/// Prompt for a value with no default, looping until non-empty input is
-/// given. If stdin hits EOF before that happens, gives up and returns an
-/// empty string rather than looping forever.
-fn prompt_required(label: &str) -> Result<String> {
-    loop {
-        match read_prompt(label, None)? {
-            None => return Ok(String::new()),
-            Some(value) if !value.is_empty() => return Ok(value),
-            Some(_) => println!("{label} is required."),
-        }
-    }
 }
 
 /// Prompt for the vault path, validating that it exists as a directory. If
@@ -701,36 +509,17 @@ fn maybe_setup_cron() -> Result<()> {
         Some(_) => return Ok(()),
     }
 
-    let profile = prompt_or_default(
-        "Profile name to fetch (leave blank to specify subreddits/sources directly)",
-        "",
-    )?;
+    let sources = prompt_or_default("Saved source labels (comma-separated, blank for none)", "")?;
 
-    let fetch_args = if !profile.trim().is_empty() {
-        format!("--profile {}", profile.trim())
-    } else {
-        let subreddits = prompt_or_default("Subreddits (comma-separated, blank for none)", "")?;
-        let sources =
-            prompt_or_default("Saved source labels (comma-separated, blank for none)", "")?;
+    if sources.trim().is_empty() {
+        println!(
+            "warning: no source labels were given -- there's nothing to fetch, so no cron \
+             entry will be installed."
+        );
+        return Ok(());
+    }
 
-        let mut parts = Vec::new();
-        if !subreddits.trim().is_empty() {
-            parts.push(format!("-s {}", subreddits.trim()));
-        }
-        if !sources.trim().is_empty() {
-            parts.push(format!("--source {}", sources.trim()));
-        }
-
-        if parts.is_empty() {
-            println!(
-                "warning: no subreddits or source labels were given -- there's nothing to \
-                 fetch, so no cron entry will be installed."
-            );
-            return Ok(());
-        }
-
-        parts.join(" ")
-    };
+    let fetch_args = format!("--source {}", sources.trim());
 
     let (hour, minute) = loop {
         match read_prompt("Time to run daily (HH:MM, 24h)", Some("08:00"))? {
@@ -831,56 +620,6 @@ fn handle_config(action: &ConfigAction, config: &Config) -> Result<()> {
     Ok(())
 }
 
-fn handle_profile(action: &ProfileAction, config: &Config) -> Result<()> {
-    // Profiles are DB-backed now (drip-15n.9.3), not part of `config.toml`
-    // -- see `src/profiles.rs`. Reuse the same `db::open` pattern already
-    // used by `handle_fetch`/`handle_init`/`handle_config`.
-    let conn = db::open(config)?;
-
-    match action {
-        ProfileAction::Add(args) => {
-            profiles::upsert(
-                &conn,
-                &args.name,
-                &args.subreddit,
-                args.sort,
-                args.time,
-                args.query.as_deref(),
-                args.limit,
-                &args.tag,
-            )?;
-            println!("saved profile '{}'", args.name);
-        }
-        ProfileAction::Remove { name } => {
-            if profiles::remove(&conn, name)? {
-                println!("removed profile '{name}'");
-            } else {
-                println!("no profile named '{name}'");
-            }
-        }
-        ProfileAction::List => {
-            let saved = profiles::list(&conn)?;
-            if saved.is_empty() {
-                println!("no profiles saved yet");
-            } else {
-                for (name, profile) in &saved {
-                    println!(
-                        "- {} (subreddits: {}, sort: {:?}, time: {:?}, query: {:?}, limit: {}, tags: {})",
-                        name,
-                        profile.subreddits.join(", "),
-                        profile.sort,
-                        profile.time,
-                        profile.query,
-                        profile.limit,
-                        profile.tags.join(", ")
-                    );
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
 /// Handle `drip source add/remove/list` (drip-15n.9.6): CRUD over the
 /// labeled, non-Reddit sources managed via `src/sources.rs`'s labeled-CRUD
 /// functions.
@@ -936,64 +675,29 @@ fn handle_source(action: &SourceAction, config: &Config) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::Connection;
 
     /// Build a `FetchArgs` with all the flag-resolution-relevant fields set
     /// explicitly, and sensible defaults for the orthogonal ones
-    /// (min_score/folder/no_journal/dry_run/verbose), so tests only need to
-    /// spell out what they care about.
-    fn fetch_args(profile: Option<&str>, subreddit: &[&str]) -> FetchArgs {
+    /// (folder/no_journal/dry_run/verbose), so tests only need to spell out
+    /// what they care about.
+    fn fetch_args(source: &[&str]) -> FetchArgs {
         FetchArgs {
-            subreddit: subreddit.iter().map(|s| s.to_string()).collect(),
             sort: None,
             time: None,
             query: None,
             limit: None,
-            min_score: None,
-            no_nsfw: false,
             folder: None,
             tag: Vec::new(),
-            profile: profile.map(|s| s.to_string()),
             no_journal: false,
             dry_run: false,
             verbose: false,
-            source: Vec::new(),
+            source: source.iter().map(|s| s.to_string()).collect(),
         }
     }
 
-    /// A fresh, DB-backed `weekly-rust` profile fixture (rust+programming,
-    /// top, week, limit 25, tag "rust"), matching the fixture the old
-    /// TOML-based tests used before profiles moved into SQLite
-    /// (drip-15n.9.3). `profiles::find`'s subreddits join is ordered
-    /// alphabetically (see `src/profiles.rs`), so "programming" sorts before
-    /// "rust" -- callers asserting on `resolved.subreddit` order should
-    /// expect that.
-    fn conn_with_weekly_rust_profile() -> (tempfile::TempDir, Connection) {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let db_path = dir.path().join("drip.db");
-        let config = Config {
-            db_path: Some(db_path),
-            ..Config::default()
-        };
-        let conn = db::open(&config).expect("db open should succeed");
-
-        profiles::upsert(
-            &conn,
-            "weekly-rust",
-            &["rust".to_string(), "programming".to_string()],
-            Sort::Top,
-            Some(TimeFilter::Week),
-            None,
-            25,
-            &["rust".to_string()],
-        )
-        .expect("profile fixture upsert should succeed");
-
-        (dir, conn)
-    }
-
-    /// A fresh, empty DB-backed connection -- for the `filter_fetched_posts`
-    /// dedup/min-score interaction tests below, which don't need any
-    /// profile fixture.
+    /// A fresh, empty DB-backed connection -- for the settings-defaults
+    /// fallback tests below.
     fn fresh_conn() -> (tempfile::TempDir, Connection) {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("drip.db");
@@ -1003,245 +707,6 @@ mod tests {
         };
         let conn = db::open(&config).expect("db open should succeed");
         (dir, conn)
-    }
-
-    /// A minimal `Post` fixture with just the fields relevant to
-    /// `filter_fetched_posts` tests (id/title/url/score) populated
-    /// meaningfully; the rest get sane placeholder defaults. Always
-    /// `over_18: false` -- use [`sample_post_with_nsfw`] when a test needs
-    /// to control that field.
-    fn sample_post(id: &str, score: i64) -> Post {
-        sample_post_with_nsfw(id, score, false)
-    }
-
-    /// Same fixture as [`sample_post`], but with `over_18` (which
-    /// `Item::from(Post)` maps to `Item.nsfw` -- see `src/item.rs`) set
-    /// explicitly, for `--no-nsfw` filtering tests.
-    fn sample_post_with_nsfw(id: &str, score: i64, over_18: bool) -> Post {
-        Post {
-            id: id.to_string(),
-            title: format!("Post {id}"),
-            author: "someone".to_string(),
-            subreddit: "rust".to_string(),
-            permalink: format!("https://reddit.com/r/rust/comments/{id}/post/"),
-            url: format!("https://reddit.com/r/rust/comments/{id}/post/"),
-            is_self: true,
-            selftext: None,
-            score,
-            upvote_ratio: 0.9,
-            num_comments: 0,
-            created_utc: 1_700_000_000.0,
-            link_flair_text: None,
-            over_18,
-        }
-    }
-
-    #[test]
-    fn resolve_fetch_params_loads_matching_profile_when_no_subreddit_given() {
-        let (_dir, conn) = conn_with_weekly_rust_profile();
-        let args = fetch_args(Some("weekly-rust"), &[]);
-        let settings = settings::load(&conn).unwrap();
-
-        let resolved =
-            resolve_fetch_params(&args, &conn, &settings).expect("profile should resolve");
-
-        assert_eq!(
-            resolved.subreddit,
-            vec!["programming".to_string(), "rust".to_string()]
-        );
-        assert_eq!(resolved.sort, Sort::Top);
-        assert_eq!(resolved.time, Some(TimeFilter::Week));
-        assert_eq!(resolved.query, None);
-        assert_eq!(resolved.limit, 25);
-        assert_eq!(resolved.tag, vec!["rust".to_string()]);
-    }
-
-    #[test]
-    fn resolve_fetch_params_errors_clearly_for_unknown_profile() {
-        let (_dir, conn) = conn_with_weekly_rust_profile();
-        let args = fetch_args(Some("does-not-exist"), &[]);
-        let settings = settings::load(&conn).unwrap();
-
-        let err = resolve_fetch_params(&args, &conn, &settings)
-            .expect_err("unknown profile should error");
-
-        let message = err.to_string();
-        assert!(
-            message.contains("no profile named 'does-not-exist'"),
-            "unexpected error message: {message}"
-        );
-        assert!(
-            message.contains("drip profile list"),
-            "error should point users at `drip profile list`: {message}"
-        );
-    }
-
-    #[test]
-    fn resolve_fetch_params_keeps_profile_as_label_only_when_subreddit_also_given() {
-        let (_dir, conn) = conn_with_weekly_rust_profile();
-        let mut args = fetch_args(Some("weekly-rust"), &["golang"]);
-        args.sort = Some(Sort::New);
-        args.limit = Some(5);
-        let settings = settings::load(&conn).unwrap();
-
-        let resolved = resolve_fetch_params(&args, &conn, &settings)
-            .expect("profile+subreddit should keep flags, not error");
-
-        // Explicit flags win; the profile's own values (rust/programming,
-        // top, week, limit 25, tag "rust") must NOT leak through.
-        assert_eq!(resolved.subreddit, vec!["golang".to_string()]);
-        assert_eq!(resolved.sort, Sort::New);
-        assert_eq!(resolved.time, None);
-        assert_eq!(resolved.limit, 5);
-        // `--tag` wasn't given, so this falls back to `settings.default_tags`
-        // ("reddit" on a fresh DB) -- not the profile's own tag ("rust"),
-        // and not empty either (drip-15n.10).
-        assert_eq!(resolved.tag, vec!["reddit".to_string()]);
-    }
-
-    #[test]
-    fn filter_fetched_posts_with_no_min_score_and_nothing_seen_returns_everything() {
-        let (_dir, conn) = fresh_conn();
-
-        let posts = vec![sample_post("abc123", 5), sample_post("def456", 50)];
-        let expected: Vec<Item> = posts.iter().cloned().map(Item::from).collect();
-        let (source_id, filtered) = filter_fetched_posts(&conn, "rust", posts, None, false)
-            .expect("filter_fetched_posts should succeed");
-
-        assert_eq!(filtered, expected);
-        assert_eq!(
-            source_id,
-            sources::upsert_reddit_source(&conn, "rust").unwrap(),
-            "returned source_id should be the real DB id for this subreddit"
-        );
-    }
-
-    #[test]
-    fn min_score_excluded_post_is_not_marked_seen_so_it_can_reappear_later() {
-        let (_dir, conn) = fresh_conn();
-
-        let post_a = sample_post("post-a", 5);
-        let post_b = sample_post("post-b", 50);
-
-        // First fetch: min_score = 10 excludes post_a.
-        let (source_id, filtered) = filter_fetched_posts(
-            &conn,
-            "rust",
-            vec![post_a.clone(), post_b.clone()],
-            Some(10),
-            false,
-        )
-        .expect("first filter_fetched_posts call should succeed");
-        assert_eq!(filtered, vec![Item::from(post_b.clone())]);
-
-        // Simulate what handle_fetch does after a successful write: record
-        // only what survived filtering as seen. post_a never reaches this
-        // call, so it must never be marked seen.
-        dedup::record_seen(&conn, source_id, &filtered).expect("record_seen should succeed");
-
-        // Second fetch, later, with no min_score threshold this time: post_a
-        // should reappear (never marked seen), post_b should now be
-        // excluded (marked seen in the first round).
-        let (_source_id2, filtered2) = filter_fetched_posts(
-            &conn,
-            "rust",
-            vec![post_a.clone(), post_b.clone()],
-            None,
-            false,
-        )
-        .expect("second filter_fetched_posts call should succeed");
-
-        assert_eq!(
-            filtered2,
-            vec![Item::from(post_a)],
-            "post excluded by min_score earlier must reappear; post already seen must not"
-        );
-    }
-
-    #[test]
-    fn no_nsfw_excludes_marked_items_when_flag_is_true() {
-        let (_dir, conn) = fresh_conn();
-
-        let nsfw_post = sample_post_with_nsfw("nsfw-post", 5, true);
-        let clean_post = sample_post_with_nsfw("clean-post", 5, false);
-
-        let (_source_id, filtered) = filter_fetched_posts(
-            &conn,
-            "rust",
-            vec![nsfw_post, clean_post.clone()],
-            None,
-            true,
-        )
-        .expect("filter_fetched_posts should succeed");
-
-        assert_eq!(
-            filtered,
-            vec![Item::from(clean_post)],
-            "--no-nsfw should exclude only the item marked nsfw"
-        );
-    }
-
-    #[test]
-    fn nsfw_items_are_included_by_default_when_flag_is_false() {
-        let (_dir, conn) = fresh_conn();
-
-        let nsfw_post = sample_post_with_nsfw("nsfw-post", 5, true);
-        let clean_post = sample_post_with_nsfw("clean-post", 5, false);
-        let expected: Vec<Item> = vec![nsfw_post.clone(), clean_post.clone()]
-            .into_iter()
-            .map(Item::from)
-            .collect();
-
-        let (_source_id, filtered) =
-            filter_fetched_posts(&conn, "rust", vec![nsfw_post, clean_post], None, false)
-                .expect("filter_fetched_posts should succeed");
-
-        assert_eq!(
-            filtered, expected,
-            "default (no --no-nsfw) behavior must include nsfw items, unchanged from today"
-        );
-    }
-
-    #[test]
-    fn no_nsfw_excluded_post_is_not_marked_seen_so_it_can_reappear_later() {
-        let (_dir, conn) = fresh_conn();
-
-        let nsfw_post = sample_post_with_nsfw("nsfw-post", 5, true);
-        let clean_post = sample_post_with_nsfw("clean-post", 5, false);
-
-        // First fetch: --no-nsfw excludes nsfw_post.
-        let (source_id, filtered) = filter_fetched_posts(
-            &conn,
-            "rust",
-            vec![nsfw_post.clone(), clean_post.clone()],
-            None,
-            true,
-        )
-        .expect("first filter_fetched_posts call should succeed");
-        assert_eq!(filtered, vec![Item::from(clean_post.clone())]);
-
-        // Simulate what handle_fetch does after a successful write: record
-        // only what survived filtering as seen. nsfw_post never reaches this
-        // call, so it must never be marked seen.
-        dedup::record_seen(&conn, source_id, &filtered).expect("record_seen should succeed");
-
-        // Second fetch, later, with --no-nsfw off this time: nsfw_post
-        // should reappear (never marked seen), clean_post should now be
-        // excluded (marked seen in the first round).
-        let (_source_id2, filtered2) = filter_fetched_posts(
-            &conn,
-            "rust",
-            vec![nsfw_post.clone(), clean_post.clone()],
-            None,
-            false,
-        )
-        .expect("second filter_fetched_posts call should succeed");
-
-        assert_eq!(
-            filtered2,
-            vec![Item::from(nsfw_post)],
-            "item excluded by --no-nsfw earlier must reappear; item already seen must not"
-        );
     }
 
     #[test]
@@ -1258,10 +723,9 @@ mod tests {
         .unwrap();
         let settings = settings::load(&conn).unwrap();
 
-        let args = fetch_args(None, &["rust"]);
+        let args = fetch_args(&["rust"]);
 
-        let resolved =
-            resolve_fetch_params(&args, &conn, &settings).expect("no-profile fetch should resolve");
+        let resolved = resolve_fetch_params(&args, &settings);
 
         assert_eq!(resolved.sort, Sort::Top);
         assert_eq!(resolved.limit, 25);
@@ -1276,12 +740,11 @@ mod tests {
         settings::set_raw(&conn, "default_limit", "25").unwrap();
         let settings = settings::load(&conn).unwrap();
 
-        let mut args = fetch_args(None, &["rust"]);
+        let mut args = fetch_args(&["rust"]);
         args.sort = Some(Sort::New);
         args.limit = Some(3);
 
-        let resolved =
-            resolve_fetch_params(&args, &conn, &settings).expect("no-profile fetch should resolve");
+        let resolved = resolve_fetch_params(&args, &settings);
 
         assert_eq!(
             resolved.sort,
@@ -1291,40 +754,6 @@ mod tests {
         assert_eq!(
             resolved.limit, 3,
             "explicit --limit must win over settings.default_limit"
-        );
-    }
-
-    #[test]
-    fn resolve_fetch_params_combined_profile_and_subreddit_still_falls_back_to_settings_not_profile(
-    ) {
-        let (_dir, conn) = conn_with_weekly_rust_profile();
-
-        // The `weekly-rust` fixture profile is sort=Top, time=Week, limit=25,
-        // tag=["rust"]. Set settings defaults to something else again, so
-        // three distinct values are in play: the (unset) flag, the profile's
-        // own value, and the settings default -- proving which one wins.
-        settings::set_raw(&conn, "default_sort", "new").unwrap();
-        settings::set_raw(&conn, "default_limit", "7").unwrap();
-        let settings = settings::load(&conn).unwrap();
-
-        // `--profile` given TOGETHER WITH `-s/--subreddit`: per drip-15n.8,
-        // the profile is a label only here. `sort`/`limit` are left as
-        // `None` (flags not explicitly given).
-        let args = fetch_args(Some("weekly-rust"), &["golang"]);
-
-        let resolved = resolve_fetch_params(&args, &conn, &settings)
-            .expect("profile+subreddit should keep resolving, not error");
-
-        assert_eq!(
-            resolved.sort,
-            Sort::New,
-            "combined profile+subreddit case must fall back to settings.default_sort, \
-             not the profile's own sort (Top)"
-        );
-        assert_eq!(
-            resolved.limit, 7,
-            "combined profile+subreddit case must fall back to settings.default_limit, \
-             not the profile's own limit (25)"
         );
     }
 
@@ -1346,5 +775,43 @@ mod tests {
         let deduped = dedup_preserving_order(&input);
 
         assert_eq!(deduped, input);
+    }
+
+    fn sample_item(id: &str) -> Item {
+        Item {
+            id: id.to_string(),
+            title: format!("Item {id}"),
+            url: format!("https://example.com/{id}"),
+            comments_url: None,
+            author: None,
+            published_at: None,
+            summary: None,
+            score: None,
+            num_comments: None,
+            flair: None,
+            nsfw: false,
+        }
+    }
+
+    #[test]
+    fn truncate_to_limit_keeps_only_the_first_n_items_in_order() {
+        let items = vec![sample_item("a"), sample_item("b"), sample_item("c")];
+
+        let truncated = truncate_to_limit(items, 2);
+
+        assert_eq!(
+            truncated,
+            vec![sample_item("a"), sample_item("b")],
+            "should keep the first `limit` items, in their original order"
+        );
+    }
+
+    #[test]
+    fn truncate_to_limit_is_a_no_op_when_fewer_items_than_the_limit() {
+        let items = vec![sample_item("a"), sample_item("b")];
+
+        let truncated = truncate_to_limit(items.clone(), 10);
+
+        assert_eq!(truncated, items);
     }
 }

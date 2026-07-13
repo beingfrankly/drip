@@ -186,13 +186,12 @@ fn render_item(index: usize, item: &Item, source_kind: &str) -> String {
     }
     if let Some(author) = &item.author {
         if source_kind == "reddit" {
-            // Reddit's OAuth JSON API gives a bare username (e.g.
-            // "someone"), but Reddit's own Atom/RSS feed's `<author><name>`
-            // field already has the `/u/` prefix baked in (e.g.
-            // "/u/llogiq") -- these `--kind reddit` RSS-sourced items share
-            // this `source_kind == "reddit"` branch with OAuth-fetched
-            // items, so strip any pre-existing `/u/`/`u/` prefix before
-            // re-adding the canonical one, to avoid a doubled `u//u/llogiq`.
+            // Reddit's own Atom/RSS feed's `<author><name>` field already
+            // has the `/u/` prefix baked in (e.g. "/u/llogiq"), so strip any
+            // pre-existing `/u/`/`u/` prefix before re-adding the canonical
+            // one, to avoid a doubled `u//u/llogiq`. This is defensive --
+            // kept in case any future `--kind reddit` source ever supplies a
+            // bare username instead.
             let clean = author.trim_start_matches("/u/").trim_start_matches("u/");
             meta_parts.push(format!("u/{clean}"));
         } else {
@@ -547,8 +546,8 @@ mod tests {
     #[test]
     fn reddit_author_with_pre_existing_u_prefix_from_the_rss_feed_is_not_doubled() {
         // Reddit's own Atom/RSS feed's `<author><name>` field already
-        // includes the `/u/` prefix (unlike the OAuth JSON API's bare
-        // username) -- this must render as `u/llogiq`, not `u//u/llogiq`.
+        // includes the `/u/` prefix -- this must render as `u/llogiq`, not
+        // `u//u/llogiq`.
         let mut item = sample_item("abc123", "A reddit-feed-sourced post");
         item.author = Some("/u/llogiq".to_string());
 

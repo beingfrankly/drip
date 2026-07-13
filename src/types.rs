@@ -20,10 +20,10 @@ pub enum Sort {
 }
 
 impl Sort {
-    /// Lowercase string form used when building Reddit API URLs
-    /// (e.g. `https://oauth.reddit.com/r/{sub}/{sort}`), and when encoding
-    /// this value for storage in the `settings` table (see
-    /// [`crate::settings`]).
+    /// Lowercase string form used when building a subreddit's RSS/Atom feed
+    /// URL (e.g. `https://www.reddit.com/r/{sub}/{sort}/.rss`, see
+    /// [`crate::reddit_feed`]), and when encoding this value for storage in
+    /// the `settings` table (see [`crate::settings`]).
     pub fn as_str(&self) -> &'static str {
         match self {
             Sort::Hot => "hot",
