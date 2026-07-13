@@ -15,8 +15,35 @@
 
 ## Install
 
+### From a release binary
+
+Prebuilt binaries for Linux x86_64 (glibc) are attached to each [GitHub release](https://github.com/beingfrankly/drip/releases):
+
+```bash
+curl -LO https://github.com/beingfrankly/drip/releases/latest/download/drip-vX.Y.Z-x86_64-linux-gnu.tar.gz
+tar -xzf drip-vX.Y.Z-x86_64-linux-gnu.tar.gz
+sudo mv drip /usr/local/bin/
+```
+
+Replace `vX.Y.Z` with the version you want (check the releases page for the exact filename of the latest tag).
+
+### From source
+
 ```bash
 cargo install --path .
+```
+
+## Update
+
+### From a release binary
+
+Repeat the download steps above with the new version's filename — it overwrites the binary already at `/usr/local/bin/drip`.
+
+### From source
+
+```bash
+git pull
+cargo install --path . --force
 ```
 
 ## First-time setup
