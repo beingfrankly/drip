@@ -12,6 +12,7 @@ mod rss;
 mod settings;
 mod sources;
 mod types;
+mod update;
 mod youtube;
 
 use std::io::Write;
@@ -19,7 +20,7 @@ use std::io::Write;
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 
-use cli::{Cli, Commands, ConfigAction, FetchArgs, SourceAction, SourceKind};
+use cli::{Cli, Commands, ConfigAction, FetchArgs, SourceAction, SourceKind, UpdateArgs};
 use config::Config;
 use digest::{digest_filename, render_digest_note, write_digest_note, DigestRun, SourceGroup};
 use item::Item;
@@ -56,6 +57,7 @@ fn main() -> Result<()> {
         Commands::Init => handle_init(),
         Commands::Config { action } => handle_config(action, &config),
         Commands::Source { action } => handle_source(action, &config),
+        Commands::Update(args) => handle_update(args),
     }
 }
 
@@ -669,6 +671,73 @@ fn handle_source(action: &SourceAction, config: &Config) -> Result<()> {
             }
         }
     }
+    Ok(())
+}
+
+/// Handle `drip update` (bd issue drip-01g.6): check GitHub's Releases API
+/// for a newer tagged release than the running binary and, if found and
+/// confirmed, download and install it in place. See `src/update.rs` for the
+/// underlying pure logic/HTTP/filesystem operations this orchestrates.
+fn handle_update(args: &UpdateArgs) -> Result<()> {
+    let current = env!("CARGO_PKG_VERSION");
+    println!("current version: v{current}");
+
+    let release = update::fetch_latest_release(update::GITHUB_API_BASE, update::REPO, args.verbose)?;
+
+    if !update::is_newer(current, &release.tag_name) {
+        println!("drip is up to date (v{current}).");
+        return Ok(());
+    }
+
+    println!(
+        "a newer version is available: {} (current: v{current})",
+        release.tag_name
+    );
+
+    if args.check {
+        return Ok(());
+    }
+
+    let expected = update::expected_asset_name(&release.tag_name);
+    let asset = update::find_asset(&release, &expected).ok_or_else(|| {
+        anyhow::anyhow!(
+            "no release asset named '{expected}' was found for {} -- this platform may not be \
+             published yet",
+            release.tag_name
+        )
+    })?;
+
+    if !args.yes {
+        match read_prompt(&format!("Install {}? (y/N)", release.tag_name), Some("n"))? {
+            Some(answer) if answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes") => {}
+            _ => {
+                println!("update cancelled");
+                return Ok(());
+            }
+        }
+    }
+
+    let tmpdir = tempfile::tempdir().context("failed to create a temp directory for the update")?;
+
+    update::download_asset(
+        &asset.browser_download_url,
+        &tmpdir.path().join(&asset.name),
+        args.verbose,
+    )?;
+
+    let extracted = update::extract_binary(&tmpdir.path().join(&asset.name), tmpdir.path())?;
+
+    let current_exe =
+        std::env::current_exe().context("failed to resolve the running binary's own path")?;
+
+    update::install_binary(&extracted, &current_exe)?;
+
+    println!(
+        "updated to {} -- installed at {}",
+        release.tag_name,
+        current_exe.display()
+    );
+
     Ok(())
 }
 

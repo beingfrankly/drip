@@ -35,6 +35,15 @@ cargo install --path .
 
 Repeat the download steps above with the new version's filename — it overwrites the binary already at `/usr/local/bin/drip`.
 
+Or let `drip` do it for you:
+
+```bash
+drip update --check  # see if a newer version is available, without installing it
+drip update          # download and install it in place (asks for confirmation first; -y skips that)
+```
+
+`drip update` replaces whichever binary is currently running (wherever it lives — `/usr/local/bin/drip`, `~/.cargo/bin/drip`, etc.) with the latest release from GitHub. It's Linux x86_64 only for now (that's the only platform released today).
+
 ### From source
 
 ```bash

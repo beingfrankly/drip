@@ -70,6 +70,7 @@ The core loop, once installed (`cargo install --path .`):
 2. `drip source add --kind rss|youtube|reddit --url <url> --name <label>` / `drip source list` / `drip source remove --name <label>` — register/manage sources under a fetchable label. YouTube channels are fetched via their own Atom feed (`src/youtube.rs` resolves a channel id/URL to that feed URL); Reddit subreddits are fetched via Reddit's own public RSS/Atom feed (`src/reddit_feed.rs` builds that feed's URL, optionally with a sort/time window/search term baked in at registration time) — neither needs any API key, app registration, or OAuth. Fetching for both is delegated entirely to the same RSS client.
 3. `drip fetch --source <label>` — fetches one or more saved sources (comma-separated or repeated flag) into one combined digest note, appends the journal reference. `--dry-run` previews both writes without touching disk. `--sort`/`--time`/`-q`/`--query` only affect the digest note's own frontmatter/header labeling — they do not filter or search what gets fetched; that's controlled per-source at `drip source add --kind reddit` time instead (clarified in their own `--help` text now, bd issue drip-1uk.10). `--tag` adds real Obsidian tags. `-n`/`--limit` does have a real effect: it caps how many items are taken from each source's fetched feed, per source, before dedup (`truncate_to_limit` in `src/main.rs`, bd issue drip-1uk.9).
 4. `drip config show/edit/set` — inspect `config.toml` + settings, edit `config.toml` in `$EDITOR`, or set one SQLite-backed setting key.
+5. `drip update [--check] [-y]` — checks GitHub Releases for a tag newer than `env!("CARGO_PKG_VERSION")` and, if found and confirmed, downloads + installs it over the running binary (`src/update.rs`, bd issue drip-01g.6). `--check` stops after reporting; `-y` skips the confirmation prompt. Linux x86_64 only today — matches `.github/workflows/release.yml`'s single build target.
 
 Full flag reference and worked examples: `README.md`.
 
@@ -96,6 +97,7 @@ Module map — read each file's own header doc-comment for the *why*, not just t
 | `src/digest.rs` | Renders + writes one digest markdown note per fetch run, grouped by `SourceGroup` |
 | `src/journal.rs` | Finds/creates today's daily note, appends a kind-aware digest reference bullet under `## Reddit` |
 | `src/db.rs` | Opens the SQLite connection, enables foreign keys, runs pending migrations |
+| `src/update.rs` | `drip update`'s support code -- GitHub Releases API check, version comparison, download, `tar` extraction (shelled out, no archive crate), and same-directory-rename install over the running binary |
 | `src/sources.rs` | `upsert_source` (idempotent `sources` row upsert) plus `find_by_label`/`list`/`remove_by_label` backing `drip source`; `upsert_reddit_source` is `#[cfg(test)]`-only now, a fixture builder for `dedup.rs`/`fetch_runs.rs`/its own tests (bd issue drip-1uk.9) |
 | `src/settings.rs` | Key-value `settings` table (folders, date format, defaults) |
 | `src/dedup.rs` | Per-source dedup against `seen_items` (`filter_unseen`/`record_seen`), generic over `Item` |

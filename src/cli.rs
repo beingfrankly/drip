@@ -34,6 +34,8 @@ pub enum Commands {
         #[command(subcommand)]
         action: SourceAction,
     },
+    /// Check for and install a newer release
+    Update(UpdateArgs),
 }
 
 #[derive(Debug, Clone, Args)]
@@ -90,6 +92,19 @@ pub struct FetchArgs {
     /// comma-separated list.
     #[arg(long = "source", value_delimiter = ',')]
     pub source: Vec<String>,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct UpdateArgs {
+    /// Check for a newer version without downloading or installing it
+    #[arg(long)]
+    pub check: bool,
+    /// Skip the confirmation prompt before installing
+    #[arg(short = 'y', long)]
+    pub yes: bool,
+    /// Verbose logging
+    #[arg(short = 'v', long)]
+    pub verbose: bool,
 }
 
 #[derive(Debug, Subcommand)]
