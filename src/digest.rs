@@ -12,7 +12,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Local, Utc};
 
 use crate::item::Item;
-use crate::types::{Sort, TimeFilter};
+use crate::types::{Sort, SourceKind, TimeFilter};
 
 /// Characters that are unsafe (or at least unwelcome) in filenames across
 /// the platforms an Obsidian vault might live on. Any of these, wherever
@@ -24,13 +24,13 @@ const UNSAFE_FILENAME_CHARS: [char; 9] = [':', '/', '\\', '*', '?', '"', '<', '>
 const EXCERPT_CHAR_LIMIT: usize = 200;
 
 /// Identifies one group of items in a [`DigestRun`]: which source kind it
-/// came from (`"reddit"` today; `"rss"` and others later -- see bd issue
-/// drip-15n.9.6) and the group's display name (a subreddit name, for
-/// Reddit). Rendering picks source-kind-specific formatting (e.g. `## r/
-/// {name}` for Reddit) based on `kind`.
+/// came from ([`SourceKind::Reddit`]/`Rss`/`Youtube`) and the group's
+/// display name (a subreddit name, for Reddit). Rendering picks
+/// source-kind-specific formatting (e.g. `## r/{name}` for Reddit) based on
+/// `kind`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SourceGroup {
-    pub kind: String,
+    pub kind: SourceKind,
     pub name: String,
 }
 
@@ -50,9 +50,10 @@ pub struct DigestRun {
     /// Fetched items, grouped by source, in the order they should appear in
     /// the note.
     pub items_by_source: Vec<(SourceGroup, Vec<Item>)>,
-    /// The profile name used for this run, if any. Used as the digest's
-    /// filename label instead of joining source names, when available.
-    pub profile: Option<String>,
+    /// The topic name used for this run (via `--topic`), if any. Used as
+    /// the digest's filename label instead of joining source names, when
+    /// available.
+    pub topic: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -93,7 +94,7 @@ impl DigestRun {
     fn all_tags(&self) -> Vec<String> {
         let mut tags = vec!["reddit".to_string()];
         for (group, _) in &self.items_by_source {
-            if group.kind == "reddit" {
+            if group.kind.is_reddit() {
                 tags.push(format!("reddit/{}", group.name));
             }
         }
@@ -105,10 +106,10 @@ impl DigestRun {
             .collect()
     }
 
-    /// The filename label: the profile name if one was used for this run,
+    /// The filename label: the topic name if one was used for this run,
     /// otherwise a comma-joined, trimmed list of source names.
     fn label(&self) -> String {
-        match &self.profile {
+        match &self.topic {
             Some(name) if !name.trim().is_empty() => name.trim().to_string(),
             _ => self
                 .source_labels()
@@ -173,7 +174,7 @@ fn excerpt(summary: &str) -> String {
 /// `source_kind` picks the author formatting: Reddit's `u/{name}` convention
 /// only makes sense for Reddit usernames, not RSS/YouTube author names
 /// (drip-01b).
-fn render_item(index: usize, item: &Item, source_kind: &str) -> String {
+fn render_item(index: usize, item: &Item, source_kind: SourceKind) -> String {
     let nsfw = if item.nsfw { "⚠️ NSFW " } else { "" };
     let title = escape_title(&item.title);
 
@@ -185,7 +186,7 @@ fn render_item(index: usize, item: &Item, source_kind: &str) -> String {
         meta_parts.push(format!("{num_comments} comments"));
     }
     if let Some(author) = &item.author {
-        if source_kind == "reddit" {
+        if source_kind.is_reddit() {
             // Reddit's own Atom/RSS feed's `<author><name>` field already
             // has the `/u/` prefix baked in (e.g. "/u/llogiq"), so strip any
             // pre-existing `/u/`/`u/` prefix before re-adding the canonical
@@ -280,13 +281,7 @@ pub fn render_digest_note(run: &DigestRun) -> String {
     let source_labels_display = run
         .items_by_source
         .iter()
-        .map(|(group, _)| {
-            if group.kind == "reddit" {
-                format!("r/{}", group.name)
-            } else {
-                group.name.clone()
-            }
-        })
+        .map(|(group, _)| group.kind.heading_prefix(&group.name))
         .collect::<Vec<_>>()
         .join(", ");
     let sort_label = match run.time {
@@ -299,15 +294,11 @@ pub fn render_digest_note(run: &DigestRun) -> String {
     ));
 
     for (group, items) in &run.items_by_source {
-        let heading = if group.kind == "reddit" {
-            format!("## r/{}", group.name)
-        } else {
-            format!("## {}", group.name)
-        };
+        let heading = format!("## {}", group.kind.heading_prefix(&group.name));
         out.push_str(&heading);
         out.push_str("\n\n");
         for (i, item) in items.iter().enumerate() {
-            out.push_str(&render_item(i + 1, item, &group.kind));
+            out.push_str(&render_item(i + 1, item, group.kind));
             out.push_str("\n\n");
         }
     }
@@ -373,7 +364,7 @@ mod tests {
             .map(|(name, items)| {
                 (
                     SourceGroup {
-                        kind: "reddit".to_string(),
+                        kind: SourceKind::Reddit,
                         name,
                     },
                     items,
@@ -386,7 +377,7 @@ mod tests {
             query: None,
             tags: vec![],
             items_by_source,
-            profile: None,
+            topic: None,
             created_at: Utc.with_ymd_and_hms(2026, 7, 8, 14, 32, 10).unwrap(),
         }
     }
@@ -515,20 +506,20 @@ mod tests {
             items_by_source: vec![
                 (
                     SourceGroup {
-                        kind: "reddit".to_string(),
+                        kind: SourceKind::Reddit,
                         name: "rust".to_string(),
                     },
                     vec![reddit_item],
                 ),
                 (
                     SourceGroup {
-                        kind: "rss".to_string(),
+                        kind: SourceKind::Rss,
                         name: "rust-blog".to_string(),
                     },
                     vec![rss_item],
                 ),
             ],
-            profile: None,
+            topic: None,
             created_at: Utc.with_ymd_and_hms(2026, 7, 8, 14, 32, 10).unwrap(),
         };
         let note = render_digest_note(&run);
@@ -558,12 +549,12 @@ mod tests {
             tags: vec![],
             items_by_source: vec![(
                 SourceGroup {
-                    kind: "reddit".to_string(),
+                    kind: SourceKind::Reddit,
                     name: "rust".to_string(),
                 },
                 vec![item],
             )],
-            profile: None,
+            topic: None,
             created_at: Utc.with_ymd_and_hms(2026, 7, 8, 14, 32, 10).unwrap(),
         };
         let note = render_digest_note(&run);
@@ -618,9 +609,9 @@ mod tests {
     }
 
     #[test]
-    fn filename_is_sanitized_and_uses_profile_label_when_present() {
+    fn filename_is_sanitized_and_uses_topic_label_when_present() {
         let mut run = sample_run(vec![("rust".to_string(), vec![sample_item("a", "t")])]);
-        run.profile = Some("weekly: digest".to_string());
+        run.topic = Some("weekly: digest".to_string());
 
         let filename = digest_filename(&run);
         assert!(!filename.contains(':'));
@@ -629,7 +620,7 @@ mod tests {
     }
 
     #[test]
-    fn filename_joins_subreddits_when_no_profile() {
+    fn filename_joins_subreddits_when_no_topic() {
         let run = sample_run(vec![
             ("rust".to_string(), vec![sample_item("a", "t")]),
             ("programming".to_string(), vec![sample_item("b", "t2")]),

@@ -29,6 +29,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (1, include_str!("../migrations/0001_init.sql")),
     (2, include_str!("../migrations/0002_profiles.sql")),
     (3, include_str!("../migrations/0003_source_labels.sql")),
+    (4, include_str!("../migrations/0004_topics.sql")),
 ];
 
 /// Resolve the default location for `drip.db`: the same directory as
@@ -142,7 +143,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version;", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 3);
+        assert_eq!(version, 4);
     }
 
     #[test]
@@ -163,7 +164,7 @@ mod tests {
         let version: i64 = conn2
             .query_row("PRAGMA user_version;", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 3);
+        assert_eq!(version, 4);
 
         let identifier: String = conn2
             .query_row(
@@ -222,6 +223,95 @@ mod tests {
         assert_eq!(
             seen_count_after, 0,
             "seen_items should be cascade-deleted with its source"
+        );
+    }
+
+    #[test]
+    fn open_migrates_a_fresh_db_to_user_version_4() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("drip.db");
+        let config = config_with_db_path(db_path);
+
+        let conn = open(&config).expect("open should succeed");
+
+        let version: i64 = conn
+            .query_row("PRAGMA user_version;", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 4);
+    }
+
+    #[test]
+    fn deleting_a_topic_cascades_to_its_topic_sources() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("drip.db");
+        let config = config_with_db_path(db_path);
+
+        let conn = open(&config).expect("open should succeed");
+
+        conn.execute(
+            "INSERT INTO sources (id, kind, identifier) VALUES (1, 'reddit', 'rust')",
+            [],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO topics (id, name) VALUES (1, 'tech')", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO topic_sources (topic_id, source_id) VALUES (1, 1)",
+            [],
+        )
+        .unwrap();
+
+        let topic_sources_count_before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM topic_sources", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(topic_sources_count_before, 1);
+
+        conn.execute("DELETE FROM topics WHERE id = 1", []).unwrap();
+
+        let topic_sources_count_after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM topic_sources", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            topic_sources_count_after, 0,
+            "topic_sources should be cascade-deleted with its topic"
+        );
+    }
+
+    #[test]
+    fn deleting_a_source_cascades_to_its_topic_sources() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("drip.db");
+        let config = config_with_db_path(db_path);
+
+        let conn = open(&config).expect("open should succeed");
+
+        conn.execute(
+            "INSERT INTO sources (id, kind, identifier) VALUES (1, 'reddit', 'rust')",
+            [],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO topics (id, name) VALUES (1, 'tech')", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO topic_sources (topic_id, source_id) VALUES (1, 1)",
+            [],
+        )
+        .unwrap();
+
+        let topic_sources_count_before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM topic_sources", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(topic_sources_count_before, 1);
+
+        conn.execute("DELETE FROM sources WHERE id = 1", [])
+            .unwrap();
+
+        let topic_sources_count_after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM topic_sources", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            topic_sources_count_after, 0,
+            "topic_sources should be cascade-deleted with its source"
         );
     }
 }

@@ -15,13 +15,36 @@
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
 
+use crate::types::SourceKind;
+
 /// A single `sources` row, as returned by the labeled-source lookups below.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SourceRow {
     pub id: i64,
-    pub kind: String,
+    pub kind: SourceKind,
     pub identifier: String,
     pub display_name: Option<String>,
+}
+
+/// Parse a `sources.kind` TEXT column value (already read out as a
+/// `String`) into a [`SourceKind`], surfacing an unrecognized value as a
+/// normal `rusqlite::Error` (rather than panicking) so a row-mapping
+/// closure can propagate it via `?` like any other column read. In
+/// practice this should never fail -- `migrations/0001_init.sql`'s `kind IN
+/// ('reddit', 'rss', 'youtube')` CHECK constraint rejects anything else at
+/// write time -- but row-mapping closures can't return `anyhow::Error`, so
+/// this is the String<->enum conversion boundary this module owns.
+fn parse_kind_column(raw: String) -> rusqlite::Result<SourceKind> {
+    SourceKind::parse(&raw).ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(
+            1,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("unrecognized sources.kind value '{raw}'"),
+            )),
+        )
+    })
 }
 
 /// Ensure a `sources` row exists for `(kind, identifier)`, creating it if
@@ -41,10 +64,11 @@ pub struct SourceRow {
 /// `drip source list`/`drip source remove`.
 pub fn upsert_source(
     conn: &Connection,
-    kind: &str,
+    kind: SourceKind,
     identifier: &str,
     display_name: Option<&str>,
 ) -> Result<i64> {
+    let kind = kind.as_str();
     let result = match display_name {
         Some(label) => conn.execute(
             "INSERT INTO sources (kind, identifier, display_name) VALUES (?1, ?2, ?3) \
@@ -104,7 +128,7 @@ fn map_label_conflict(err: rusqlite::Error, display_name: Option<&str>) -> anyho
 /// row to exist without caring about labeling.
 #[cfg(test)]
 pub fn upsert_reddit_source(conn: &Connection, subreddit: &str) -> Result<i64> {
-    upsert_source(conn, "reddit", subreddit, None)
+    upsert_source(conn, SourceKind::Reddit, subreddit, None)
 }
 
 /// Look up a labeled source by its `display_name`. Returns `None` if no
@@ -116,7 +140,7 @@ pub fn find_by_label(conn: &Connection, label: &str) -> Result<Option<SourceRow>
         |row| {
             Ok(SourceRow {
                 id: row.get(0)?,
-                kind: row.get(1)?,
+                kind: parse_kind_column(row.get(1)?)?,
                 identifier: row.get(2)?,
                 display_name: row.get(3)?,
             })
@@ -146,7 +170,7 @@ pub fn list(conn: &Connection) -> Result<Vec<SourceRow>> {
     let rows = stmt.query_map([], |row| {
         Ok(SourceRow {
             id: row.get(0)?,
-            kind: row.get(1)?,
+            kind: parse_kind_column(row.get(1)?)?,
             identifier: row.get(2)?,
             display_name: row.get(3)?,
         })
@@ -209,7 +233,7 @@ mod tests {
 
         upsert_source(
             &conn,
-            "rss",
+            SourceKind::Rss,
             "https://example.com/feed.xml",
             Some("rust-blog"),
         )
@@ -219,7 +243,7 @@ mod tests {
             .expect("find_by_label should succeed")
             .expect("source should exist");
 
-        assert_eq!(found.kind, "rss");
+        assert_eq!(found.kind, SourceKind::Rss);
         assert_eq!(found.identifier, "https://example.com/feed.xml");
         assert_eq!(found.display_name, Some("rust-blog".to_string()));
     }
@@ -230,14 +254,14 @@ mod tests {
 
         let id1 = upsert_source(
             &conn,
-            "rss",
+            SourceKind::Rss,
             "https://example.com/feed.xml",
             Some("old-name"),
         )
         .expect("first upsert should succeed");
         let id2 = upsert_source(
             &conn,
-            "rss",
+            SourceKind::Rss,
             "https://example.com/feed.xml",
             Some("new-name"),
         )
@@ -269,7 +293,7 @@ mod tests {
 
         upsert_source(
             &conn,
-            "rss",
+            SourceKind::Rss,
             "https://example.com/feed-a.xml",
             Some("taken"),
         )
@@ -277,7 +301,7 @@ mod tests {
 
         let err = upsert_source(
             &conn,
-            "rss",
+            SourceKind::Rss,
             "https://example.com/feed-b.xml",
             Some("taken"),
         )
@@ -309,7 +333,7 @@ mod tests {
 
         upsert_source(
             &conn,
-            "rss",
+            SourceKind::Rss,
             "https://example.com/feed.xml",
             Some("rust-blog"),
         )
@@ -332,7 +356,7 @@ mod tests {
 
         upsert_source(
             &conn,
-            "rss",
+            SourceKind::Rss,
             "https://example.com/feed.xml",
             Some("rust-blog"),
         )
@@ -350,7 +374,7 @@ mod tests {
 
         upsert_source(
             &conn,
-            "rss",
+            SourceKind::Rss,
             "https://example.com/feed.xml",
             Some("rust-blog"),
         )

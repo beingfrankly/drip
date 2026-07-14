@@ -11,6 +11,7 @@ mod reddit_feed;
 mod rss;
 mod settings;
 mod sources;
+mod topics;
 mod types;
 mod update;
 mod youtube;
@@ -19,12 +20,13 @@ use std::io::Write;
 
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
+use rusqlite::Connection;
 
-use cli::{Cli, Commands, ConfigAction, FetchArgs, SourceAction, SourceKind, UpdateArgs};
+use cli::{Cli, Commands, ConfigAction, FetchArgs, SourceAction, TopicAction, UpdateArgs};
 use config::Config;
 use digest::{digest_filename, render_digest_note, write_digest_note, DigestRun, SourceGroup};
 use item::Item;
-use types::{Sort, TimeFilter};
+use types::{Sort, SourceKind, TimeFilter};
 
 /// Print `msg` when `verbose` is true; a no-op otherwise. This is the single
 /// gate for verbose-only diagnostic output (request URLs, rate-limit
@@ -57,6 +59,7 @@ fn main() -> Result<()> {
         Commands::Init => handle_init(),
         Commands::Config { action } => handle_config(action, &config),
         Commands::Source { action } => handle_source(action, &config),
+        Commands::Topic { action } => handle_topic(action, &config),
         Commands::Update(args) => handle_update(args),
     }
 }
@@ -99,11 +102,13 @@ fn resolve_fetch_params(args: &FetchArgs, settings: &settings::Settings) -> Reso
 }
 
 /// Deduplicate `items` while preserving first-occurrence order. Used to
-/// guard the `--source` list against exact duplicates (e.g. `--source
-/// rust,rust`) before it drives a fetch loop -- both to avoid a wasted
-/// duplicate network fetch and, more importantly, to avoid two
-/// `SourceGroup`s resolving to the same `source_id` later in `handle_fetch`
-/// (see the `source_ids`/`groups` comment there for why that matters).
+/// guard the combined `--source`+`--topic`-resolved label list against
+/// exact duplicates (e.g. `--source rust,rust`, or a source named by both
+/// `--source` and a `--topic` it belongs to) before it drives a fetch loop
+/// -- both to avoid a wasted duplicate network fetch and, more importantly,
+/// to avoid two `SourceGroup`s resolving to the same `source_id` later in
+/// `handle_fetch` (see the `source_ids`/`groups` comment there for why that
+/// matters).
 fn dedup_preserving_order(items: &[String]) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
     items
@@ -111,6 +116,56 @@ fn dedup_preserving_order(items: &[String]) -> Vec<String> {
         .filter(|item| seen.insert((*item).clone()))
         .cloned()
         .collect()
+}
+
+/// Resolve `topic_names` (each a `--topic` label) into the labels of their
+/// member sources, via `topics::sources_for_topic`. Returns the resolved
+/// labels together with a warning message for each problem encountered along
+/// the way (an unknown topic name, or -- defensively -- a member source
+/// with no `display_name` label). Callers are expected to `eprintln!` each
+/// warning themselves (prefixed the same way the existing per-`--source`-
+/// label warnings in `handle_fetch`'s fetch loop are), rather than aborting
+/// the whole fetch over one bad `--topic` name.
+///
+/// Kept as its own pure(-ish; it reads `conn`) function, separate from
+/// `handle_fetch`, so this resolution step -- and its warning text -- is
+/// unit-testable without a real fetch (bd issue drip-p6v.7).
+fn resolve_topic_labels(conn: &Connection, topic_names: &[String]) -> (Vec<String>, Vec<String>) {
+    let mut labels = Vec::new();
+    let mut warnings = Vec::new();
+
+    for topic_name in topic_names {
+        match topics::sources_for_topic(conn, topic_name) {
+            Ok(members) => {
+                for member in members {
+                    match member.display_name {
+                        Some(label) => labels.push(label),
+                        // Every member of a topic was attached via
+                        // `add_source_to_topic`, which requires a
+                        // labeled (`find_by_label`-resolved) source, so
+                        // `display_name` should always be `Some` here. A
+                        // `None` would mean the data itself is
+                        // inconsistent, not that the user did anything
+                        // wrong -- skip it with a warning rather than
+                        // panicking.
+                        None => warnings.push(format!(
+                            "topic '{topic_name}' has a member source (id {}) with no label; \
+                             skipping it (this indicates a data-integrity issue, not a normal \
+                             user error)",
+                            member.id
+                        )),
+                    }
+                }
+            }
+            // `sources_for_topic`'s own error text already names the topic
+            // and points at `drip topic list`, mirroring the clarity bar
+            // set by the existing "no saved source named ... (run `drip
+            // source list` ...)" warning for an unknown `--source` label.
+            Err(err) => warnings.push(err.to_string()),
+        }
+    }
+
+    (labels, warnings)
 }
 
 /// Cap a single source's freshly-fetched `items` (before dedup) at
@@ -138,17 +193,33 @@ fn handle_fetch(args: &FetchArgs, config: &Config) -> Result<()> {
         format!("resolved fetch params:\n{:#?}", resolved),
     );
 
-    if args.source.is_empty() {
-        eprintln!("drip fetch: no --source given, nothing to fetch");
+    if args.source.is_empty() && args.topic.is_empty() {
+        eprintln!("drip fetch: no --source or --topic given, nothing to fetch");
         return Ok(());
     }
 
+    // Resolve `--topic` names into their member sources' labels and merge
+    // them with `--source`'s labels into ONE unified list (bd issue
+    // drip-p6v.7) -- this is purely a resolution step in front of the
+    // existing fetch loop below, not a second/parallel pipeline. Any
+    // problem resolving a topic (an unknown topic name, or -- defensively
+    // -- a member source with no label) is reported as a warning rather
+    // than aborting the whole fetch, the same way an unknown `--source`
+    // label is handled below.
+    let (topic_labels, topic_warnings) = resolve_topic_labels(&conn, &args.topic);
+    for warning in &topic_warnings {
+        eprintln!("warning: {warning}");
+    }
+    let mut combined_labels: Vec<String> = args.source.clone();
+    combined_labels.extend(topic_labels);
+
     // Deduplicate up front, preserving first-occurrence order -- an exact
-    // duplicate (e.g. `--source rust,rust`) would otherwise trigger a wasted
-    // duplicate fetch AND produce two `SourceGroup`s that resolve to the
-    // same `source_id`, which crashes `fetch_runs::record`'s
+    // duplicate (e.g. `--source rust,rust`, or a source named by both
+    // `--source` and a `--topic` it belongs to) would otherwise trigger a
+    // wasted duplicate fetch AND produce two `SourceGroup`s that resolve to
+    // the same `source_id`, which crashes `fetch_runs::record`'s
     // `PRIMARY KEY(fetch_run_id, source_id)` insert further down.
-    let sources_to_fetch = dedup_preserving_order(&args.source);
+    let sources_to_fetch = dedup_preserving_order(&combined_labels);
 
     // `groups`/`source_ids` are shared across the fetch loop below.
     // `source_ids` is keyed by `(kind, name)` rather than bare `name` so
@@ -160,20 +231,17 @@ fn handle_fetch(args: &FetchArgs, config: &Config) -> Result<()> {
     // within `args.source` are handled separately, by deduplicating it up
     // front via `dedup_preserving_order` before the fetch loop runs below.
     let mut groups: Vec<(SourceGroup, Vec<Item>)> = Vec::new();
-    let mut source_ids: std::collections::HashMap<(String, String), i64> =
+    let mut source_ids: std::collections::HashMap<(SourceKind, String), i64> =
         std::collections::HashMap::new();
 
     if !sources_to_fetch.is_empty() {
         for label in &sources_to_fetch {
             match sources::find_by_label(&conn, label) {
                 Ok(Some(source_row)) => {
-                    let fetch_result = match source_row.kind.as_str() {
-                        "rss" | "youtube" | "reddit" => {
+                    let fetch_result = match source_row.kind {
+                        SourceKind::Rss | SourceKind::Youtube | SourceKind::Reddit => {
                             rss::fetch(&source_row.identifier, args.verbose)
                         }
-                        other => Err(anyhow::anyhow!(
-                            "source '{label}' has unsupported kind '{other}'"
-                        )),
                     };
                     match fetch_result {
                         Ok(items) => {
@@ -192,11 +260,10 @@ fn handle_fetch(args: &FetchArgs, config: &Config) -> Result<()> {
                                 println!("{label}: fetched {new} item(s)");
                             }
 
-                            source_ids
-                                .insert((source_row.kind.clone(), label.clone()), source_row.id);
+                            source_ids.insert((source_row.kind, label.clone()), source_row.id);
                             groups.push((
                                 SourceGroup {
-                                    kind: source_row.kind.clone(),
+                                    kind: source_row.kind,
                                     name: label.clone(),
                                 },
                                 filtered,
@@ -227,7 +294,7 @@ fn handle_fetch(args: &FetchArgs, config: &Config) -> Result<()> {
         .iter()
         .filter_map(|(group, items)| {
             source_ids
-                .get(&(group.kind.clone(), group.name.clone()))
+                .get(&(group.kind, group.name.clone()))
                 .map(|&id| (id, items.len()))
         })
         .collect();
@@ -239,13 +306,30 @@ fn handle_fetch(args: &FetchArgs, config: &Config) -> Result<()> {
         return Ok(());
     }
 
+    // Label the digest's filename with the `--topic` name when exactly one
+    // topic was given and it resolved successfully (bd issue drip-p6v.8) --
+    // `topic_warnings` being empty is what "resolved successfully" means
+    // here, since `resolve_topic_labels` only ever pushes a warning for an
+    // unknown topic name or a data-integrity issue with one of its members.
+    // Zero topics falls back to `None` (the existing joined-source-labels
+    // behavior, unchanged). More than one topic isn't covered by the bd
+    // issue's acceptance criteria; join the topic names the same way
+    // multiple sources already join in `source_labels()`, rather than
+    // picking one arbitrarily or over-engineering a dedicated format.
+    let topic_label = match args.topic.as_slice() {
+        [] => None,
+        [single] if topic_warnings.is_empty() => Some(single.clone()),
+        [_single_with_warnings] => None,
+        multiple => Some(multiple.join(", ")),
+    };
+
     let run = DigestRun {
         sort: resolved.sort,
         time: resolved.time,
         query: resolved.query.clone(),
         tags: resolved.tag.clone(),
         items_by_source: groups,
-        profile: None,
+        topic: topic_label,
         created_at: chrono::Utc::now(),
     };
 
@@ -298,7 +382,7 @@ fn handle_fetch(args: &FetchArgs, config: &Config) -> Result<()> {
     // reaches here -- and deliberately independent of `--no-journal`, since
     // this is about the digest note, not the journal.
     for (group, items) in &run.items_by_source {
-        if let Some(source_id) = source_ids.get(&(group.kind.clone(), group.name.clone())) {
+        if let Some(source_id) = source_ids.get(&(group.kind, group.name.clone())) {
             dedup::record_seen(&conn, *source_id, items)?;
         }
     }
@@ -629,23 +713,22 @@ fn handle_source(action: &SourceAction, config: &Config) -> Result<()> {
     let conn = db::open(config)?;
     match action {
         SourceAction::Add(args) => {
-            let (kind_str, identifier) = match args.kind {
-                SourceKind::Rss => ("rss", args.url.clone()),
-                SourceKind::Youtube => ("youtube", youtube::channel_feed_url(&args.url)?),
-                SourceKind::Reddit => (
-                    "reddit",
-                    reddit_feed::subreddit_feed_url(
-                        &args.url,
-                        args.sort,
-                        args.time,
-                        args.search.as_deref(),
-                    )?,
-                ),
+            let identifier = match args.kind {
+                SourceKind::Rss => args.url.clone(),
+                SourceKind::Youtube => youtube::channel_feed_url(&args.url)?,
+                SourceKind::Reddit => reddit_feed::subreddit_feed_url(
+                    &args.url,
+                    args.sort,
+                    args.time,
+                    args.search.as_deref(),
+                )?,
             };
-            sources::upsert_source(&conn, kind_str, &identifier, Some(&args.name))?;
+            sources::upsert_source(&conn, args.kind, &identifier, Some(&args.name))?;
             println!(
-                "saved source '{}' (kind: {kind_str}, url: {})",
-                args.name, identifier
+                "saved source '{}' (kind: {}, url: {})",
+                args.name,
+                args.kind.as_str(),
+                identifier
             );
         }
         SourceAction::Remove { name } => {
@@ -664,9 +747,52 @@ fn handle_source(action: &SourceAction, config: &Config) -> Result<()> {
                     println!(
                         "- {} (kind: {}, url: {})",
                         row.display_name.as_deref().unwrap_or("?"),
-                        row.kind,
+                        row.kind.as_str(),
                         row.identifier
                     );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Handle `drip topic add/add-source/remove-source/remove/list` (bd issue
+/// drip-p6v.6): CRUD over topics and their source membership, via
+/// `src/topics.rs`'s labeled-CRUD functions.
+fn handle_topic(action: &TopicAction, config: &Config) -> Result<()> {
+    let conn = db::open(config)?;
+    match action {
+        TopicAction::Add { name } => {
+            topics::create_topic(&conn, name)?;
+            println!("created topic '{name}'");
+        }
+        TopicAction::AddSource { topic, source } => {
+            topics::add_source_to_topic(&conn, topic, source)?;
+            println!("added source '{source}' to topic '{topic}'");
+        }
+        TopicAction::RemoveSource { topic, source } => {
+            topics::remove_source_from_topic(&conn, topic, source)?;
+            println!("removed source '{source}' from topic '{topic}'");
+        }
+        TopicAction::Remove { name } => {
+            if topics::remove_topic(&conn, name)? {
+                println!("removed topic '{name}'");
+            } else {
+                println!("no topic named '{name}'");
+            }
+        }
+        TopicAction::List => {
+            let saved = topics::list_topics(&conn)?;
+            if saved.is_empty() {
+                println!("no topics saved yet");
+            } else {
+                for topic in &saved {
+                    if topic.source_labels.is_empty() {
+                        println!("- {} (no sources)", topic.name);
+                    } else {
+                        println!("- {}: {}", topic.name, topic.source_labels.join(", "));
+                    }
                 }
             }
         }
@@ -762,6 +888,16 @@ mod tests {
             dry_run: false,
             verbose: false,
             source: source.iter().map(|s| s.to_string()).collect(),
+            topic: Vec::new(),
+        }
+    }
+
+    /// Like [`fetch_args`], but also sets `--topic` labels -- for
+    /// `handle_fetch`'s `--topic` resolution tests (bd issue drip-p6v.7).
+    fn fetch_args_with_topics(source: &[&str], topic: &[&str]) -> FetchArgs {
+        FetchArgs {
+            topic: topic.iter().map(|s| s.to_string()).collect(),
+            ..fetch_args(source)
         }
     }
 
@@ -882,5 +1018,442 @@ mod tests {
         let truncated = truncate_to_limit(items.clone(), 10);
 
         assert_eq!(truncated, items);
+    }
+
+    /// A fresh, temp-dir-backed `Config` for `handle_topic` end-to-end
+    /// tests -- mirrors `fresh_conn` above, but `handle_topic` opens its own
+    /// connection from the `Config`, so tests need the `Config` itself
+    /// rather than an already-open `Connection`.
+    fn fresh_config() -> (tempfile::TempDir, Config) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("drip.db");
+        let config = Config {
+            db_path: Some(db_path),
+            ..Config::default()
+        };
+        (dir, config)
+    }
+
+    #[test]
+    fn handle_topic_add_creates_a_topic() {
+        let (_dir, config) = fresh_config();
+
+        handle_topic(&TopicAction::Add { name: "rust".to_string() }, &config)
+            .expect("adding a new topic should succeed");
+
+        let conn = db::open(&config).unwrap();
+        let listed = topics::list_topics(&conn).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].name, "rust");
+    }
+
+    #[test]
+    fn handle_topic_add_with_taken_name_errors_clearly() {
+        let (_dir, config) = fresh_config();
+
+        handle_topic(&TopicAction::Add { name: "rust".to_string() }, &config).unwrap();
+        let err = handle_topic(&TopicAction::Add { name: "rust".to_string() }, &config)
+            .expect_err("duplicate topic name should error");
+
+        assert!(err.to_string().contains("already exists"));
+    }
+
+    #[test]
+    fn handle_topic_add_source_and_remove_source_round_trip() {
+        let (_dir, config) = fresh_config();
+
+        handle_topic(&TopicAction::Add { name: "rust".to_string() }, &config).unwrap();
+        {
+            let conn = db::open(&config).unwrap();
+            sources::upsert_source(
+                &conn,
+                SourceKind::Rss,
+                "https://example.com/rust.xml",
+                Some("rust-blog"),
+            )
+            .unwrap();
+        }
+
+        handle_topic(
+            &TopicAction::AddSource {
+                topic: "rust".to_string(),
+                source: "rust-blog".to_string(),
+            },
+            &config,
+        )
+        .expect("adding a saved source to an existing topic should succeed");
+
+        let conn = db::open(&config).unwrap();
+        let listed = topics::list_topics(&conn).unwrap();
+        assert_eq!(listed[0].source_labels, vec!["rust-blog".to_string()]);
+        drop(conn);
+
+        handle_topic(
+            &TopicAction::RemoveSource {
+                topic: "rust".to_string(),
+                source: "rust-blog".to_string(),
+            },
+            &config,
+        )
+        .expect("removing a member source should succeed");
+
+        let conn = db::open(&config).unwrap();
+        let listed = topics::list_topics(&conn).unwrap();
+        assert!(listed[0].source_labels.is_empty());
+    }
+
+    #[test]
+    fn handle_topic_add_source_errors_clearly_when_topic_missing() {
+        let (_dir, config) = fresh_config();
+        {
+            let conn = db::open(&config).unwrap();
+            sources::upsert_source(
+                &conn,
+                SourceKind::Rss,
+                "https://example.com/rust.xml",
+                Some("rust-blog"),
+            )
+            .unwrap();
+        }
+
+        let err = handle_topic(
+            &TopicAction::AddSource {
+                topic: "does-not-exist".to_string(),
+                source: "rust-blog".to_string(),
+            },
+            &config,
+        )
+        .expect_err("missing topic should error");
+
+        assert!(err.to_string().contains("does-not-exist"));
+    }
+
+    #[test]
+    fn handle_topic_add_source_errors_clearly_when_source_missing() {
+        let (_dir, config) = fresh_config();
+        handle_topic(&TopicAction::Add { name: "rust".to_string() }, &config).unwrap();
+
+        let err = handle_topic(
+            &TopicAction::AddSource {
+                topic: "rust".to_string(),
+                source: "does-not-exist".to_string(),
+            },
+            &config,
+        )
+        .expect_err("missing source should error");
+
+        assert!(err.to_string().contains("does-not-exist"));
+    }
+
+    #[test]
+    fn handle_topic_remove_deletes_an_existing_topic() {
+        let (_dir, config) = fresh_config();
+        handle_topic(&TopicAction::Add { name: "rust".to_string() }, &config).unwrap();
+
+        handle_topic(&TopicAction::Remove { name: "rust".to_string() }, &config)
+            .expect("removing an existing topic should succeed");
+
+        let conn = db::open(&config).unwrap();
+        assert!(topics::list_topics(&conn).unwrap().is_empty());
+    }
+
+    #[test]
+    fn handle_topic_remove_of_unknown_name_is_not_an_error() {
+        let (_dir, config) = fresh_config();
+
+        handle_topic(
+            &TopicAction::Remove {
+                name: "does-not-exist".to_string(),
+            },
+            &config,
+        )
+        .expect("removing an unknown topic should succeed (not-found is printed, not an error)");
+    }
+
+    #[test]
+    fn handle_topic_list_succeeds_on_an_empty_db() {
+        let (_dir, config) = fresh_config();
+
+        handle_topic(&TopicAction::List, &config).expect("listing with no topics should succeed");
+    }
+
+    // -- `--topic` resolution/wiring tests (bd issue drip-p6v.7) --
+
+    /// A minimal RSS 2.0 fixture with one `<item>`, labeled by `id` so
+    /// different mocked sources produce distinguishable items -- mirrors
+    /// `src/rss.rs`'s own `RSS_FIXTURE` test fixture.
+    fn rss_fixture(id: &str) -> String {
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>Feed {id}</title>
+    <link>https://example.com/</link>
+    <description>Feed {id}</description>
+    <item>
+      <title>Post from {id}</title>
+      <link>https://example.com/{id}/post</link>
+      <guid>https://example.com/{id}/post</guid>
+      <pubDate>Mon, 06 Jul 2026 12:00:00 GMT</pubDate>
+      <description>A post from {id}.</description>
+    </item>
+  </channel>
+</rss>"#
+        )
+    }
+
+    /// Register a saved RSS source labeled `label`, backed by a mocked feed
+    /// served by `server` at `/{label}.xml` returning [`rss_fixture`]`(label)`.
+    fn register_mocked_rss_source(conn: &Connection, server: &mut mockito::ServerGuard, label: &str) {
+        let _mock = server
+            .mock("GET", format!("/{label}.xml").as_str())
+            .with_status(200)
+            .with_header("content-type", "application/rss+xml")
+            .with_body(rss_fixture(label))
+            .create();
+
+        let url = format!("{}/{label}.xml", server.url());
+        sources::upsert_source(conn, SourceKind::Rss, &url, Some(label))
+            .expect("upsert_source should succeed");
+    }
+
+    /// A fresh, temp-dir-backed `Config` with a real `vault_path` set
+    /// (unlike `fresh_config` above, which leaves `vault_path` empty) -- for
+    /// `handle_fetch` end-to-end tests below, which need `write_digest_note`
+    /// to actually succeed.
+    fn fresh_config_with_vault() -> (tempfile::TempDir, tempfile::TempDir, Config) {
+        let db_dir = tempfile::tempdir().expect("tempdir");
+        let vault_dir = tempfile::tempdir().expect("tempdir");
+        let db_path = db_dir.path().join("drip.db");
+        let config = Config {
+            vault_path: vault_dir.path().to_path_buf(),
+            db_path: Some(db_path),
+        };
+        (db_dir, vault_dir, config)
+    }
+
+    /// Read the single digest note written under the default
+    /// `posts_folder` ("Resources/Reddit") inside `vault_dir`, as a string.
+    /// Panics if there isn't exactly one file there -- every test using this
+    /// helper expects exactly one fetch run to have written exactly one note.
+    fn read_only_digest_note(vault_dir: &std::path::Path) -> String {
+        let posts_dir = vault_dir.join("Resources/Reddit");
+        let mut entries: Vec<_> = std::fs::read_dir(&posts_dir)
+            .unwrap_or_else(|err| panic!("failed to read {}: {err}", posts_dir.display()))
+            .filter_map(|entry| entry.ok())
+            .collect();
+        assert_eq!(
+            entries.len(),
+            1,
+            "expected exactly one digest note in {}",
+            posts_dir.display()
+        );
+        std::fs::read_to_string(entries.remove(0).path()).expect("failed to read digest note")
+    }
+
+    #[test]
+    fn fetch_with_topic_fetches_all_member_sources_into_one_digest() {
+        let (_db_dir, vault_dir, config) = fresh_config_with_vault();
+        let mut server = mockito::Server::new();
+
+        {
+            let conn = db::open(&config).unwrap();
+            for label in ["a", "b", "c"] {
+                register_mocked_rss_source(&conn, &mut server, label);
+            }
+            topics::create_topic(&conn, "typescript").unwrap();
+            for label in ["a", "b", "c"] {
+                topics::add_source_to_topic(&conn, "typescript", label).unwrap();
+            }
+        }
+
+        handle_fetch(&fetch_args_with_topics(&[], &["typescript"]), &config)
+            .expect("fetch with --topic should succeed");
+
+        let note = read_only_digest_note(vault_dir.path());
+        for label in ["a", "b", "c"] {
+            assert!(
+                note.contains(&format!("Post from {label}")),
+                "digest note should include an item from source '{label}':\n{note}"
+            );
+        }
+    }
+
+    #[test]
+    fn fetch_with_single_topic_labels_digest_filename_with_topic_name() {
+        // bd issue drip-p6v.8: a single `--topic` resolves to a filename
+        // label of the topic name itself, not the joined member-source
+        // labels ("a, b, c").
+        let (_db_dir, vault_dir, config) = fresh_config_with_vault();
+        let mut server = mockito::Server::new();
+
+        {
+            let conn = db::open(&config).unwrap();
+            for label in ["a", "b", "c"] {
+                register_mocked_rss_source(&conn, &mut server, label);
+            }
+            topics::create_topic(&conn, "typescript").unwrap();
+            for label in ["a", "b", "c"] {
+                topics::add_source_to_topic(&conn, "typescript", label).unwrap();
+            }
+        }
+
+        handle_fetch(&fetch_args_with_topics(&[], &["typescript"]), &config)
+            .expect("fetch with --topic should succeed");
+
+        let posts_dir = vault_dir.path().join("Resources/Reddit");
+        let mut entries: Vec<_> = std::fs::read_dir(&posts_dir)
+            .unwrap_or_else(|err| panic!("failed to read {}: {err}", posts_dir.display()))
+            .filter_map(|entry| entry.ok())
+            .collect();
+        assert_eq!(
+            entries.len(),
+            1,
+            "expected exactly one digest note in {}",
+            posts_dir.display()
+        );
+        let filename = entries
+            .remove(0)
+            .file_name()
+            .to_str()
+            .expect("filename should be valid UTF-8")
+            .to_string();
+
+        assert!(
+            filename.contains("(typescript)"),
+            "expected the digest filename to be labeled with the topic name, not the joined \
+             member-source labels:\n{filename}"
+        );
+        assert!(
+            !filename.contains("a, b, c"),
+            "digest filename should not fall back to the joined member-source labels:\n{filename}"
+        );
+    }
+
+    #[test]
+    fn fetch_with_topic_is_identical_to_the_equivalent_source_list() {
+        // Two separate configs/vaults, one driven by `--topic typescript`
+        // (whose members are a/b/c) and one by the equivalent `--source
+        // a,b,c` -- both should produce a digest note mentioning the same
+        // three fetched items.
+        let (_db_dir_topic, vault_dir_topic, config_topic) = fresh_config_with_vault();
+        let (_db_dir_source, vault_dir_source, config_source) = fresh_config_with_vault();
+        let mut server = mockito::Server::new();
+
+        for (conn_config, use_topic) in [(&config_topic, true), (&config_source, false)] {
+            let conn = db::open(conn_config).unwrap();
+            for label in ["a", "b", "c"] {
+                register_mocked_rss_source(&conn, &mut server, label);
+            }
+            if use_topic {
+                topics::create_topic(&conn, "typescript").unwrap();
+                for label in ["a", "b", "c"] {
+                    topics::add_source_to_topic(&conn, "typescript", label).unwrap();
+                }
+            }
+        }
+
+        handle_fetch(
+            &fetch_args_with_topics(&[], &["typescript"]),
+            &config_topic,
+        )
+        .expect("fetch with --topic should succeed");
+        handle_fetch(&fetch_args(&["a", "b", "c"]), &config_source)
+            .expect("fetch with --source should succeed");
+
+        let note_via_topic = read_only_digest_note(vault_dir_topic.path());
+        let note_via_source = read_only_digest_note(vault_dir_source.path());
+
+        for label in ["a", "b", "c"] {
+            let needle = format!("Post from {label}");
+            assert!(note_via_topic.contains(&needle));
+            assert!(note_via_source.contains(&needle));
+        }
+    }
+
+    #[test]
+    fn fetch_with_overlapping_source_and_topic_fetches_the_shared_source_once() {
+        let (_db_dir, vault_dir, config) = fresh_config_with_vault();
+        let mut server = mockito::Server::new();
+
+        {
+            let conn = db::open(&config).unwrap();
+            for label in ["x", "b", "c"] {
+                register_mocked_rss_source(&conn, &mut server, label);
+            }
+            topics::create_topic(&conn, "typescript").unwrap();
+            for label in ["x", "b", "c"] {
+                topics::add_source_to_topic(&conn, "typescript", label).unwrap();
+            }
+        }
+
+        // "x" is named by both `--source` AND the `typescript` topic it
+        // belongs to -- it must be fetched exactly once, not twice.
+        handle_fetch(
+            &fetch_args_with_topics(&["x"], &["typescript"]),
+            &config,
+        )
+        .expect("fetch with overlapping --source/--topic should succeed");
+
+        let note = read_only_digest_note(vault_dir.path());
+        let x_occurrences = note.matches("Post from x").count();
+        assert_eq!(
+            x_occurrences, 1,
+            "source 'x' named by both --source and --topic should appear exactly once:\n{note}"
+        );
+        // Sanity: the other topic members still made it in too.
+        assert!(note.contains("Post from b"));
+        assert!(note.contains("Post from c"));
+    }
+
+    #[test]
+    fn resolve_topic_labels_returns_member_labels_for_a_known_topic() {
+        let (_dir, conn) = fresh_conn();
+
+        sources::upsert_source(
+            &conn,
+            SourceKind::Rss,
+            "https://example.com/a.xml",
+            Some("a"),
+        )
+        .unwrap();
+        sources::upsert_source(
+            &conn,
+            SourceKind::Rss,
+            "https://example.com/b.xml",
+            Some("b"),
+        )
+        .unwrap();
+        topics::create_topic(&conn, "typescript").unwrap();
+        topics::add_source_to_topic(&conn, "typescript", "a").unwrap();
+        topics::add_source_to_topic(&conn, "typescript", "b").unwrap();
+
+        let (labels, warnings) =
+            resolve_topic_labels(&conn, &["typescript".to_string()]);
+
+        assert_eq!(labels, vec!["a".to_string(), "b".to_string()]);
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn resolve_topic_labels_warns_clearly_on_an_unknown_topic_name() {
+        let (_dir, conn) = fresh_conn();
+
+        let (labels, warnings) =
+            resolve_topic_labels(&conn, &["does-not-exist".to_string()]);
+
+        assert!(labels.is_empty());
+        assert_eq!(warnings.len(), 1);
+        assert!(
+            warnings[0].contains("does-not-exist"),
+            "warning should name the unknown topic: {}",
+            warnings[0]
+        );
+        assert!(
+            warnings[0].contains("drip topic list"),
+            "warning should point users at `drip topic list`, matching the clarity of the \
+             existing unknown --source warning: {}",
+            warnings[0]
+        );
     }
 }

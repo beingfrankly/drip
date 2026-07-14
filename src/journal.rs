@@ -81,9 +81,9 @@ pub fn ensure_daily_note(
 ///
 /// Named source-kind-neutrally (rather than `reddit_bullet`) since a digest
 /// can include non-Reddit source groups too (see bd issue drip-15n.9.6):
-/// each group renders as `r/{name}` when `group.kind == "reddit"`, else
-/// bare `{name}` — mirroring the exact same conditional `src/digest.rs`
-/// already uses for its own heading/`**Subreddits:**` rendering.
+/// each group's label is rendered via [`SourceKind::heading_prefix`], the
+/// same centralized decision point `src/digest.rs` uses for its own
+/// heading/`**Subreddits:**` rendering (bd issue drip-p6v.4).
 pub fn digest_bullet(
     digest_note_basename: &str,
     groups: &[SourceGroup],
@@ -91,13 +91,7 @@ pub fn digest_bullet(
 ) -> String {
     let source_labels = groups
         .iter()
-        .map(|group| {
-            if group.kind == "reddit" {
-                format!("r/{}", group.name)
-            } else {
-                group.name.clone()
-            }
-        })
+        .map(|group| group.kind.heading_prefix(&group.name))
         .collect::<Vec<_>>()
         .join(", ");
     format!("- [[{digest_note_basename}]] — {post_count} posts from {source_labels}")
@@ -202,13 +196,14 @@ fn bump_modified_on(content: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::SourceKind;
 
     const DAILY_NOTES_FOLDER: &str = "Journal/Daily notes";
     const DAILY_NOTE_FORMAT: &str = "%Y-%m-%d";
 
     fn reddit_group(name: &str) -> SourceGroup {
         SourceGroup {
-            kind: "reddit".to_string(),
+            kind: SourceKind::Reddit,
             name: name.to_string(),
         }
     }
@@ -390,7 +385,7 @@ mod tests {
     #[test]
     fn digest_bullet_renders_non_reddit_groups_without_the_r_prefix() {
         let rss_group = SourceGroup {
-            kind: "rss".to_string(),
+            kind: SourceKind::Rss,
             name: "rust-blog".to_string(),
         };
 

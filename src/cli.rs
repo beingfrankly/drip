@@ -1,8 +1,8 @@
 //! CLI surface for `drip`, defined with clap's derive API.
 
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand};
 
-use crate::types::{Sort, TimeFilter};
+use crate::types::{Sort, SourceKind, TimeFilter};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -33,6 +33,11 @@ pub enum Commands {
     Source {
         #[command(subcommand)]
         action: SourceAction,
+    },
+    /// Manage topics: named groups of saved sources
+    Topic {
+        #[command(subcommand)]
+        action: TopicAction,
     },
     /// Check for and install a newer release
     Update(UpdateArgs),
@@ -92,6 +97,15 @@ pub struct FetchArgs {
     /// comma-separated list.
     #[arg(long = "source", value_delimiter = ',')]
     pub source: Vec<String>,
+
+    /// Saved topic name(s) to include in this fetch (see `drip topic add`/
+    /// `drip topic list`). Repeat the flag or pass a comma-separated list.
+    /// Each named topic is resolved into its member sources' labels, which
+    /// are then merged with any `--source` labels given in the same
+    /// invocation -- a source named by both `--source` and a `--topic` it
+    /// belongs to is still fetched exactly once, not twice.
+    #[arg(long = "topic", value_delimiter = ',')]
+    pub topic: Vec<String>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -137,6 +151,36 @@ pub enum SourceAction {
     List,
 }
 
+#[derive(Debug, Subcommand)]
+pub enum TopicAction {
+    /// Create a new topic
+    Add {
+        #[arg(long)]
+        name: String,
+    },
+    /// Add a saved source to a topic
+    AddSource {
+        #[arg(long)]
+        topic: String,
+        #[arg(long)]
+        source: String,
+    },
+    /// Remove a saved source from a topic
+    RemoveSource {
+        #[arg(long)]
+        topic: String,
+        #[arg(long)]
+        source: String,
+    },
+    /// Remove a topic
+    Remove {
+        #[arg(long)]
+        name: String,
+    },
+    /// List saved topics and their member sources
+    List,
+}
+
 #[derive(Debug, Clone, Args)]
 pub struct SourceAddArgs {
     #[arg(long, value_enum)]
@@ -169,16 +213,4 @@ pub struct SourceAddArgs {
     /// filter; flair isn't exposed by this feed.
     #[arg(long = "search")]
     pub search: Option<String>,
-}
-
-/// The kind of a `drip source add`-registered source. Deliberately its own
-/// enum (rather than reusing `sources::kind` strings directly in the CLI
-/// layer) so it can be extended (`Youtube`, added for bd issue drip-15n.9.7;
-/// `Reddit`, added for bd issue drip-khu) without redesigning this command.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-#[value(rename_all = "lowercase")]
-pub enum SourceKind {
-    Rss,
-    Youtube,
-    Reddit,
 }
