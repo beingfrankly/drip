@@ -109,6 +109,32 @@ drip source list
 drip source remove --name rust-blog
 ```
 
+### Topics: grouping sources
+
+A topic is a named group of already-saved sources — fetch the whole group with one `--topic` name instead of typing every member's `--source` label each time:
+
+```bash
+drip topic add --name rust
+drip topic add-source --topic rust --source rust-hot
+drip topic add-source --topic rust --source rust-blog
+
+drip fetch --topic rust
+```
+
+`--topic` accepts a comma-separated list (repeat the flag or comma-separate), the same as `--source`, and both can be combined in one `drip fetch` — each named topic is resolved into its member sources' labels and merged with any `--source` labels given, with a source named by both fetched exactly once, not twice:
+
+```bash
+drip fetch --source rust-weekly-top --topic rust
+```
+
+When exactly one `--topic` is given and it resolves cleanly, the digest note's filename and header are labeled with the topic's name (e.g. `rust`) instead of joining every member source's label. With zero `--topic`s, or one that fails to resolve (e.g. a typo), it falls back to the existing joined-source-labels behavior; with more than one `--topic`, it labels the note with the topic names joined instead.
+
+```bash
+drip topic remove-source --topic rust --source rust-blog  # detach one source
+drip topic remove --name rust                              # delete the topic (its sources are unaffected)
+drip topic list                                             # see saved topics and their members
+```
+
 ### Fetch options
 
 Tag the resulting note and preview without writing anything to the vault or journal:
@@ -181,3 +207,7 @@ Enable with:
 ```bash
 systemctl --user enable --now drip-fetch.timer
 ```
+
+## Using with Claude Code
+
+This repo ships a Claude Code skill at `.claude/skills/drip/SKILL.md` that teaches Claude Code the full `drip` command surface — subcommands, flags, and gotchas like `--sort`/`--time`/`-q` on `drip fetch` being cosmetic-only — so an agent can operate `drip` correctly on request. Claude Code picks it up automatically for repos it's working in, no setup needed.
