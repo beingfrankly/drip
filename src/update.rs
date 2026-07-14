@@ -9,7 +9,6 @@
 //! and matching how `.github/workflows/release.yml` itself produces the
 //! release archive with `tar -czf`).
 
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -217,10 +216,11 @@ pub fn extract_binary(archive_path: &Path, dest_dir: &Path) -> Result<PathBuf> {
 /// Copies `new_binary` to a temp file in the SAME DIRECTORY as `current_exe`
 /// (so the final `rename` is on the same filesystem -- `std::fs::rename` is
 /// only atomic/guaranteed-to-work across paths on the same filesystem;
-/// crossing a mount boundary can fail with `EXDEV`), marks it executable,
-/// then renames it over `current_exe`. Renaming over a running executable is
-/// safe on Linux -- the kernel keeps the old inode alive for the
-/// still-running process.
+/// crossing a mount boundary can fail with `EXDEV`), marks it executable on
+/// Unix (Windows has no POSIX executable bit -- a `.exe` is executable by
+/// extension alone, so that step is skipped there), then renames it over
+/// `current_exe`. Renaming over a running executable is safe on Linux --
+/// the kernel keeps the old inode alive for the still-running process.
 ///
 /// On any failure, the temp file is best-effort cleaned up before the error
 /// is returned.
@@ -238,8 +238,11 @@ pub fn install_binary(new_binary: &Path, current_exe: &Path) -> Result<()> {
         });
     }
 
-    if let Err(err) = std::fs::set_permissions(&temp_path, std::fs::Permissions::from_mode(0o755))
-    {
+    #[cfg(unix)]
+    if let Err(err) = std::fs::set_permissions(
+        &temp_path,
+        std::os::unix::fs::PermissionsExt::from_mode(0o755),
+    ) {
         let _ = std::fs::remove_file(&temp_path);
         return Err(err).with_context(|| {
             format!("failed to mark {} as executable", temp_path.display())
@@ -494,10 +497,17 @@ mod tests {
         let content = std::fs::read(&current_exe).expect("current_exe should be readable");
         assert_eq!(content, b"new binary content");
 
-        let mode = std::fs::metadata(&current_exe)
-            .expect("metadata should be readable")
-            .permissions()
-            .mode();
-        assert!(mode & 0o111 != 0, "installed binary should be executable");
+        // The executable bit is a POSIX concept; Windows has no equivalent
+        // (a `.exe` is executable by extension alone), so only assert it on
+        // Unix -- see `install_binary`'s own `#[cfg(unix)]` chmod step.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&current_exe)
+                .expect("metadata should be readable")
+                .permissions()
+                .mode();
+            assert!(mode & 0o111 != 0, "installed binary should be executable");
+        }
     }
 }
