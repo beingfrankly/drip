@@ -47,9 +47,9 @@ Topics are named groups of saved sources, so a recurring set of labels can be fe
 - `drip topic remove --name <name>` — delete a topic. Does **not** delete its member sources — only the topic and its membership rows.
 - `drip topic list` — list every saved topic with its member sources' labels.
 
-### `drip fetch --source <label>[,<label>...] --topic <name>[,<name>...] [flags]`
+### `drip fetch --source <label>[,<label>...] --topic <name>[,<name>...] --all [flags]`
 
-Fetches one or more saved sources (comma-separated, or repeat `--source`) and/or one or more saved topics (comma-separated, or repeat `--topic`) into one combined digest note, then appends the journal reference (unless suppressed).
+Fetches one or more saved sources (comma-separated, or repeat `--source`) and/or one or more saved topics (comma-separated, or repeat `--topic`) and/or every saved source (`--all`) into one combined digest note, then appends the journal reference (unless suppressed).
 
 Flags:
 
@@ -59,6 +59,7 @@ Flags:
 - `-n`/`--limit <n>` — caps how many items are taken **per source**, before dedup. Falls back to saved `default_limit`.
 - `--tag <tag>[,<tag>...]` — adds real Obsidian tags to the digest note (repeat flag or comma-separate). Falls back to saved `default_tags`.
 - `--topic <name>[,<name>...]` — each named topic (see `drip topic add`/`drip topic list`) is resolved into its member sources' labels and merged with any `--source` labels given in the same invocation. A source named by both `--source` and a `--topic` it belongs to is still fetched exactly once, not twice. An unknown topic name warns clearly (`no topic named '<name>' (run \`drip topic list\`)`) rather than aborting the whole fetch.
+- `--all` — fetch every saved source (see `drip source list`), regardless of `--source`/`--topic` selection. Merges/dedups with any `--source`/`--topic` also given, so a source selected more than one way is still fetched exactly once. Since a topic is just a named group of already-saved sources, `--all` inherently covers everything any topic references — it does not need to iterate topics separately. With no saved sources at all, prints a clear message to stderr and writes nothing (`drip fetch: --all given but no sources are saved yet (run \`drip source add\` first)`). Useful for a stable unattended cron command that doesn't need to enumerate labels.
 - `--folder <name>` — overrides the configured posts folder for this run only.
 - `--no-journal` — skip appending a reference to the daily journal note.
 - `--dry-run` — preview both writes (digest note + journal reference) without touching disk.
@@ -107,4 +108,8 @@ drip topic add-source --topic rust --source rust-blog
 
 # Fetch the whole topic in one go -- digest filename/header is labeled "rust"
 drip fetch --topic rust --tag rust
+
+# Fetch every saved source in one combined digest -- e.g. for a stable
+# unattended cron command that doesn't need to enumerate labels
+drip fetch --all --tag digest
 ```

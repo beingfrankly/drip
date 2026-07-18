@@ -193,8 +193,8 @@ fn handle_fetch(args: &FetchArgs, config: &Config) -> Result<()> {
         format!("resolved fetch params:\n{:#?}", resolved),
     );
 
-    if args.source.is_empty() && args.topic.is_empty() {
-        eprintln!("drip fetch: no --source or --topic given, nothing to fetch");
+    if args.source.is_empty() && args.topic.is_empty() && !args.all {
+        eprintln!("drip fetch: no --source, --topic, or --all given, nothing to fetch");
         return Ok(());
     }
 
@@ -212,6 +212,28 @@ fn handle_fetch(args: &FetchArgs, config: &Config) -> Result<()> {
     }
     let mut combined_labels: Vec<String> = args.source.clone();
     combined_labels.extend(topic_labels);
+
+    // `--all` means "every saved (labeled) source" (bd issue drip-l4o) --
+    // since topics are just named groups of already-saved sources, fetching
+    // all sources inherently covers everything any topic references, so this
+    // expands into the same `combined_labels` list `--source`/`--topic` feed
+    // into, rather than a separate pipeline. The dedup guard right below
+    // already handles overlap with `--source`/`--topic`, so a source named
+    // both ways is still fetched exactly once.
+    if args.all {
+        let all_sources = sources::list(&conn)?;
+        if all_sources.is_empty() {
+            eprintln!(
+                "drip fetch: --all given but no sources are saved yet (run `drip source add` first)"
+            );
+            return Ok(());
+        }
+        for row in all_sources {
+            if let Some(label) = row.display_name {
+                combined_labels.push(label);
+            }
+        }
+    }
 
     // Deduplicate up front, preserving first-occurrence order -- an exact
     // duplicate (e.g. `--source rust,rust`, or a source named by both
@@ -889,6 +911,7 @@ mod tests {
             verbose: false,
             source: source.iter().map(|s| s.to_string()).collect(),
             topic: Vec::new(),
+            all: false,
         }
     }
 
@@ -898,6 +921,16 @@ mod tests {
         FetchArgs {
             topic: topic.iter().map(|s| s.to_string()).collect(),
             ..fetch_args(source)
+        }
+    }
+
+    /// Like [`fetch_args`], but sets `--all` with no explicit `--source`/
+    /// `--topic` -- for `handle_fetch`'s `--all` resolution tests (bd issue
+    /// drip-l4o).
+    fn fetch_args_all() -> FetchArgs {
+        FetchArgs {
+            all: true,
+            ..fetch_args(&[])
         }
     }
 
@@ -1404,6 +1437,50 @@ mod tests {
         // Sanity: the other topic members still made it in too.
         assert!(note.contains("Post from b"));
         assert!(note.contains("Post from c"));
+    }
+
+    #[test]
+    fn fetch_with_all_fetches_every_saved_source() {
+        let (_db_dir, vault_dir, config) = fresh_config_with_vault();
+        let mut server = mockito::Server::new();
+
+        {
+            let conn = db::open(&config).unwrap();
+            for label in ["a", "b", "c"] {
+                register_mocked_rss_source(&conn, &mut server, label);
+            }
+            // Deliberately no topic created -- `--all` means "every saved
+            // source" and must not depend on any topic membership.
+        }
+
+        handle_fetch(&fetch_args_all(), &config).expect("fetch with --all should succeed");
+
+        let note = read_only_digest_note(vault_dir.path());
+        for label in ["a", "b", "c"] {
+            assert!(
+                note.contains(&format!("Post from {label}")),
+                "digest note should include an item from source '{label}':\n{note}"
+            );
+        }
+    }
+
+    #[test]
+    fn fetch_with_all_on_empty_db_writes_nothing() {
+        let (_db_dir, vault_dir, config) = fresh_config_with_vault();
+
+        handle_fetch(&fetch_args_all(), &config)
+            .expect("fetch with --all on an empty db should still return Ok");
+
+        let posts_dir = vault_dir.path().join("Resources/Reddit");
+        let wrote_nothing = !posts_dir.exists()
+            || std::fs::read_dir(&posts_dir)
+                .expect("failed to read posts dir")
+                .next()
+                .is_none();
+        assert!(
+            wrote_nothing,
+            "no digest note should be written when --all is given but no sources are saved"
+        );
     }
 
     #[test]

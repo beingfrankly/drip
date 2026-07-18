@@ -135,6 +135,16 @@ drip topic remove --name rust                              # delete the topic (i
 drip topic list                                             # see saved topics and their members
 ```
 
+### Fetching every saved source
+
+`--all` fetches every saved source (see `drip source list`) into one combined digest, without needing to enumerate `--source`/`--topic`:
+
+```bash
+drip fetch --all
+```
+
+It merges/dedups with any `--source`/`--topic` also given in the same invocation — a source selected more than one way is still fetched exactly once. Because a topic is just a named group of already-saved sources, `--all` inherently covers everything any topic references, so it never needs to iterate topics itself. With no sources saved at all, it prints a clear message and does nothing. This makes it a good fit for a stable unattended cron/systemd command that shouldn't need updating every time a new source is registered.
+
 ### Fetch options
 
 Tag the resulting note and preview without writing anything to the vault or journal:

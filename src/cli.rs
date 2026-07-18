@@ -106,6 +106,14 @@ pub struct FetchArgs {
     /// belongs to is still fetched exactly once, not twice.
     #[arg(long = "topic", value_delimiter = ',')]
     pub topic: Vec<String>,
+
+    /// Fetch every saved source (see `drip source list`), ignoring the need
+    /// for explicit `--source`/`--topic` selection. Merges with any
+    /// `--source`/`--topic` also given (a source selected more than one way
+    /// is still fetched exactly once). With no saved sources, prints a clear
+    /// message and does nothing.
+    #[arg(long = "all")]
+    pub all: bool,
 }
 
 #[derive(Debug, Clone, Args)]
