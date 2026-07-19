@@ -91,7 +91,7 @@ Flags:
 
 ### `drip update [--check] [-y]`
 
-Checks GitHub Releases for a newer tag than the running binary's version. `--check` reports only, without installing. `-y` skips the install confirmation prompt. Downloads and installs over the currently running binary, wherever it lives. **Linux x86_64 only** today (the only platform currently released).
+Checks GitHub Releases for a newer tag than the running binary's version. `--check` reports only, without installing. `-y` skips the install confirmation prompt. Downloads and installs over the currently running binary, wherever it lives. Works on every platform drip publishes prebuilt binaries for — **Linux x86_64, macOS (x86_64 and Apple Silicon), and Windows x86_64** (the cargo-dist release targets); on any other platform it reports that no prebuilt binary is available and points at `cargo install`/the releases page instead.
 
 ## Digest format
 

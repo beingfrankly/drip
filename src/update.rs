@@ -4,10 +4,14 @@
 //!
 //! Deliberately uses no new dependencies -- `reqwest`/`serde`/`serde_json`
 //! are already used elsewhere in this codebase, and archive extraction
-//! shells out to the system `tar` binary (matching `src/cron.rs`'s
-//! precedent of shelling out to a system tool rather than adding a crate,
-//! and matching how `.github/workflows/release.yml` itself produces the
-//! release archive with `tar -czf`).
+//! shells out to a system tool (`tar` on Unix, PowerShell's
+//! `Expand-Archive` on Windows) rather than adding an archive crate,
+//! matching `src/cron.rs`'s precedent of shelling out to a system tool.
+//! Releases are now produced by cargo-dist (see
+//! `.github/workflows/release.yml`), which publishes per-target archives
+//! with no version string in the filename: `.tar.xz` for Unix targets
+//! (binary inside a `drip-<triple>/` subdirectory) and `.zip` for Windows
+//! (binary at the archive root).
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -119,11 +123,24 @@ pub fn is_newer(current: &str, latest_tag: &str) -> bool {
     }
 }
 
-/// The exact release-asset filename `.github/workflows/release.yml` produces
-/// for a given tag, e.g. `expected_asset_name("v0.1.0") ==
-/// "drip-v0.1.0-x86_64-linux-gnu.tar.gz"`.
-pub fn expected_asset_name(tag: &str) -> String {
-    format!("drip-{tag}-x86_64-linux-gnu.tar.gz")
+/// The cargo-dist release-asset filename for a given (os, arch), matching
+/// `.github/workflows/release.yml` exactly. `os`/`arch` use the same values
+/// as `std::env::consts::OS`/`ARCH`. Returns `None` for a platform drip does
+/// not publish a prebuilt binary for. Note: unlike the old hand-rolled
+/// naming scheme, cargo-dist asset names carry NO version string.
+pub fn asset_name_for(os: &str, arch: &str) -> Option<&'static str> {
+    match (os, arch) {
+        ("linux", "x86_64") => Some("drip-x86_64-unknown-linux-gnu.tar.xz"),
+        ("macos", "x86_64") => Some("drip-x86_64-apple-darwin.tar.xz"),
+        ("macos", "aarch64") => Some("drip-aarch64-apple-darwin.tar.xz"),
+        ("windows", "x86_64") => Some("drip-x86_64-pc-windows-msvc.zip"),
+        _ => None,
+    }
+}
+
+/// The asset name for the platform THIS binary was built for.
+pub fn expected_asset_name() -> Option<&'static str> {
+    asset_name_for(std::env::consts::OS, std::env::consts::ARCH)
 }
 
 /// Find the asset in `release.assets` whose `name` exactly equals
@@ -165,23 +182,61 @@ pub fn download_asset(url: &str, dest: &Path, verbose: bool) -> Result<()> {
     Ok(())
 }
 
-/// Extract the `drip` binary out of the `.tar.gz` archive at `archive_path`
-/// into `dest_dir`, shelling out to the system `tar` binary. Returns the
-/// path to the extracted `drip` file.
+/// The binary filename inside a release archive for the current platform:
+/// `drip.exe` on Windows, `drip` elsewhere.
+fn archive_binary_name() -> &'static str {
+    if cfg!(windows) {
+        "drip.exe"
+    } else {
+        "drip"
+    }
+}
+
+/// Recursively search `dir` for a file literally named `name`, returning the
+/// first match found. The trees this searches are tiny (a handful of files
+/// from a single release archive), so a plain recursive walk is fine -- no
+/// need for a directory-walking crate.
+fn find_file_named(dir: &Path, name: &str) -> Option<PathBuf> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    let mut subdirs = Vec::new();
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            subdirs.push(path);
+        } else if path.file_name().and_then(|f| f.to_str()) == Some(name) {
+            return Some(path);
+        }
+    }
+
+    for subdir in subdirs {
+        if let Some(found) = find_file_named(&subdir, name) {
+            return Some(found);
+        }
+    }
+
+    None
+}
+
+/// Extract the `drip` binary out of the release archive at `archive_path`
+/// into `dest_dir`, and return the path to the extracted binary.
 ///
-/// `release.yml`'s `tar -czf ... -C target/release drip` puts a single file
-/// named `drip` at the archive root -- no subdirectory -- so the returned
-/// path is always `dest_dir.join("drip")`.
+/// cargo-dist's archive layout differs by platform: Unix `.tar.xz` archives
+/// put the binary inside a `drip-<triple>/` subdirectory, while the Windows
+/// `.zip` puts `drip.exe` at the archive root. Rather than assume either
+/// layout, the binary is located by name (`archive_binary_name`) anywhere
+/// under `dest_dir` after extraction via [`find_file_named`].
+#[cfg(unix)]
 pub fn extract_binary(archive_path: &Path, dest_dir: &Path) -> Result<PathBuf> {
     let output = Command::new("tar")
-        .arg("-xzf")
+        .arg("-xf")
         .arg(archive_path)
         .arg("-C")
         .arg(dest_dir)
         .output()
         .with_context(|| {
             format!(
-                "failed to run `tar -xzf {} -C {}`",
+                "failed to run `tar -xf {} -C {}`",
                 archive_path.display(),
                 dest_dir.display()
             )
@@ -190,7 +245,7 @@ pub fn extract_binary(archive_path: &Path, dest_dir: &Path) -> Result<PathBuf> {
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         bail!(
-            "`tar -xzf {} -C {}` exited with a non-zero status ({}): {}",
+            "`tar -xf {} -C {}` exited with a non-zero status ({}): {}",
             archive_path.display(),
             dest_dir.display(),
             output.status,
@@ -198,16 +253,50 @@ pub fn extract_binary(archive_path: &Path, dest_dir: &Path) -> Result<PathBuf> {
         );
     }
 
-    let extracted = dest_dir.join("drip");
-    if !extracted.exists() {
-        bail!(
-            "expected extracted binary at {} but it does not exist after `tar -xzf {}`",
-            extracted.display(),
+    let name = archive_binary_name();
+    find_file_named(dest_dir, name).ok_or_else(|| {
+        anyhow::anyhow!(
+            "could not find a file named '{name}' anywhere under {} after extracting {}",
+            dest_dir.display(),
             archive_path.display()
+        )
+    })
+}
+
+/// Windows counterpart of [`extract_binary`]: extracts a `.zip` archive via
+/// PowerShell's `Expand-Archive` (no archive crate dependency, matching this
+/// module's "shell out to a system tool" convention), then locates
+/// `drip.exe` under `dest_dir` the same way the Unix branch does.
+#[cfg(windows)]
+pub fn extract_binary(archive_path: &Path, dest_dir: &Path) -> Result<PathBuf> {
+    let command = format!(
+        "Expand-Archive -LiteralPath '{}' -DestinationPath '{}' -Force",
+        archive_path.display(),
+        dest_dir.display()
+    );
+
+    let output = Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &command])
+        .output()
+        .with_context(|| format!("failed to run PowerShell Expand-Archive: {command}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "PowerShell Expand-Archive exited with a non-zero status ({}): {}",
+            output.status,
+            stderr.trim()
         );
     }
 
-    Ok(extracted)
+    let name = archive_binary_name();
+    find_file_named(dest_dir, name).ok_or_else(|| {
+        anyhow::anyhow!(
+            "could not find a file named '{name}' anywhere under {} after extracting {}",
+            dest_dir.display(),
+            archive_path.display()
+        )
+    })
 }
 
 /// Safely replace the running binary at `current_exe` with the contents of
@@ -216,14 +305,14 @@ pub fn extract_binary(archive_path: &Path, dest_dir: &Path) -> Result<PathBuf> {
 /// Copies `new_binary` to a temp file in the SAME DIRECTORY as `current_exe`
 /// (so the final `rename` is on the same filesystem -- `std::fs::rename` is
 /// only atomic/guaranteed-to-work across paths on the same filesystem;
-/// crossing a mount boundary can fail with `EXDEV`), marks it executable on
-/// Unix (Windows has no POSIX executable bit -- a `.exe` is executable by
-/// extension alone, so that step is skipped there), then renames it over
-/// `current_exe`. Renaming over a running executable is safe on Linux --
-/// the kernel keeps the old inode alive for the still-running process.
+/// crossing a mount boundary can fail with `EXDEV`), marks it executable,
+/// then renames it over `current_exe`. Renaming over a running executable is
+/// safe on Linux -- the kernel keeps the old inode alive for the still-
+/// running process.
 ///
 /// On any failure, the temp file is best-effort cleaned up before the error
 /// is returned.
+#[cfg(unix)]
 pub fn install_binary(new_binary: &Path, current_exe: &Path) -> Result<()> {
     let temp_path = current_exe.with_extension("new");
 
@@ -238,7 +327,6 @@ pub fn install_binary(new_binary: &Path, current_exe: &Path) -> Result<()> {
         });
     }
 
-    #[cfg(unix)]
     if let Err(err) = std::fs::set_permissions(
         &temp_path,
         std::os::unix::fs::PermissionsExt::from_mode(0o755),
@@ -259,6 +347,56 @@ pub fn install_binary(new_binary: &Path, current_exe: &Path) -> Result<()> {
             )
         });
     }
+
+    Ok(())
+}
+
+/// Windows counterpart of [`install_binary`]. Windows refuses to overwrite
+/// (rename over or truncate) an `.exe` file that's currently running, so the
+/// approach differs from the Unix branch: the running `current_exe` is
+/// first renamed to a sidelined `.old` path -- the running process keeps
+/// executing fine from that renamed file, Windows just won't let it be
+/// deleted or replaced by name anymore -- freeing up `current_exe`'s
+/// original name, and then the new binary is copied into that freed name.
+/// The sidelined `.old` file is best-effort removed afterward; while the
+/// old process is still running this removal will typically fail with a
+/// sharing violation, which is expected and ignored.
+///
+/// On any failure after the rename, best-effort attempts to restore the
+/// original binary before returning the error.
+#[cfg(windows)]
+pub fn install_binary(new_binary: &Path, current_exe: &Path) -> Result<()> {
+    let sidelined_path = current_exe.with_extension("old.exe");
+
+    // Best-effort: an `.old.exe` left over from a previous update attempt
+    // may still be present and would make this rename fail.
+    let _ = std::fs::remove_file(&sidelined_path);
+
+    std::fs::rename(current_exe, &sidelined_path).with_context(|| {
+        format!(
+            "failed to sideline the running binary from {} to {} -- if this is a permissions \
+             error, re-run with elevated permissions or reinstall manually",
+            current_exe.display(),
+            sidelined_path.display()
+        )
+    })?;
+
+    if let Err(err) = std::fs::copy(new_binary, current_exe) {
+        // Best-effort restore so the install isn't left in a broken state.
+        let _ = std::fs::rename(&sidelined_path, current_exe);
+        return Err(err).with_context(|| {
+            format!(
+                "failed to install the new binary to {} -- if this is a permissions error, \
+                 re-run with elevated permissions or reinstall manually",
+                current_exe.display()
+            )
+        });
+    }
+
+    // Best-effort cleanup: while the old (still-running) process holds this
+    // file open, removal will typically fail with a sharing violation --
+    // that's expected and not a failure of the update itself.
+    let _ = std::fs::remove_file(&sidelined_path);
 
     Ok(())
 }
@@ -315,11 +453,27 @@ mod tests {
     }
 
     #[test]
-    fn expected_asset_name_matches_release_yml_naming() {
+    fn asset_name_for_matches_cargo_dist_naming() {
         assert_eq!(
-            expected_asset_name("v0.1.0"),
-            "drip-v0.1.0-x86_64-linux-gnu.tar.gz"
+            asset_name_for("linux", "x86_64"),
+            Some("drip-x86_64-unknown-linux-gnu.tar.xz")
         );
+        assert_eq!(
+            asset_name_for("macos", "x86_64"),
+            Some("drip-x86_64-apple-darwin.tar.xz")
+        );
+        assert_eq!(
+            asset_name_for("macos", "aarch64"),
+            Some("drip-aarch64-apple-darwin.tar.xz")
+        );
+        assert_eq!(
+            asset_name_for("windows", "x86_64"),
+            Some("drip-x86_64-pc-windows-msvc.zip")
+        );
+
+        assert_eq!(asset_name_for("linux", "aarch64"), None);
+        assert_eq!(asset_name_for("windows", "aarch64"), None);
+        assert_eq!(asset_name_for("freebsd", "x86_64"), None);
     }
 
     #[test]
@@ -328,17 +482,17 @@ mod tests {
             tag_name: "v0.1.0".to_string(),
             assets: vec![
                 GithubAsset {
-                    name: "drip-v0.1.0-x86_64-linux-gnu.tar.gz".to_string(),
+                    name: "drip-x86_64-unknown-linux-gnu.tar.xz".to_string(),
                     browser_download_url: "https://example.com/a".to_string(),
                 },
                 GithubAsset {
-                    name: "drip-v0.1.0-aarch64-linux-gnu.tar.gz".to_string(),
+                    name: "drip-aarch64-apple-darwin.tar.xz".to_string(),
                     browser_download_url: "https://example.com/b".to_string(),
                 },
             ],
         };
 
-        let found = find_asset(&release, "drip-v0.1.0-x86_64-linux-gnu.tar.gz")
+        let found = find_asset(&release, "drip-x86_64-unknown-linux-gnu.tar.xz")
             .expect("should find the matching asset");
         assert_eq!(found.browser_download_url, "https://example.com/a");
     }
@@ -348,12 +502,12 @@ mod tests {
         let release = GithubRelease {
             tag_name: "v0.1.0".to_string(),
             assets: vec![GithubAsset {
-                name: "drip-v0.1.0-aarch64-linux-gnu.tar.gz".to_string(),
+                name: "drip-aarch64-apple-darwin.tar.xz".to_string(),
                 browser_download_url: "https://example.com/b".to_string(),
             }],
         };
 
-        assert!(find_asset(&release, "drip-v0.1.0-x86_64-linux-gnu.tar.gz").is_none());
+        assert!(find_asset(&release, "drip-x86_64-unknown-linux-gnu.tar.xz").is_none());
     }
 
     #[test]
@@ -368,8 +522,8 @@ mod tests {
             "body": "Initial release",
             "assets": [
                 {
-                    "name": "drip-v0.1.0-x86_64-linux-gnu.tar.gz",
-                    "browser_download_url": "https://github.com/beingfrankly/drip/releases/download/v0.1.0/drip-v0.1.0-x86_64-linux-gnu.tar.gz",
+                    "name": "drip-x86_64-unknown-linux-gnu.tar.xz",
+                    "browser_download_url": "https://github.com/beingfrankly/drip/releases/download/v0.1.0/drip-x86_64-unknown-linux-gnu.tar.xz",
                     "size": 1234567,
                     "id": 999
                 }
@@ -387,10 +541,10 @@ mod tests {
 
         assert_eq!(release.tag_name, "v0.1.0");
         assert_eq!(release.assets.len(), 1);
-        assert_eq!(release.assets[0].name, "drip-v0.1.0-x86_64-linux-gnu.tar.gz");
+        assert_eq!(release.assets[0].name, "drip-x86_64-unknown-linux-gnu.tar.xz");
         assert_eq!(
             release.assets[0].browser_download_url,
-            "https://github.com/beingfrankly/drip/releases/download/v0.1.0/drip-v0.1.0-x86_64-linux-gnu.tar.gz"
+            "https://github.com/beingfrankly/drip/releases/download/v0.1.0/drip-x86_64-unknown-linux-gnu.tar.xz"
         );
     }
 
@@ -452,31 +606,39 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
-    fn extract_binary_extracts_the_drip_file_from_a_real_tar_gz_fixture() {
+    fn extract_binary_extracts_the_drip_file_from_a_real_tar_xz_fixture() {
+        // Mirrors the real cargo-dist layout: a top-level `drip-<triple>/`
+        // directory containing `drip` (and, in real releases, a README --
+        // irrelevant to this test).
         let src_dir = tempfile::tempdir().expect("tempdir for archive contents");
+        let subdir_name = "drip-x86_64-unknown-linux-gnu";
+        let subdir = src_dir.path().join(subdir_name);
+        std::fs::create_dir(&subdir).expect("create fixture subdir");
+
         let binary_content = b"fake drip binary bytes";
-        let binary_path = src_dir.path().join("drip");
+        let binary_path = subdir.join("drip");
         std::fs::write(&binary_path, binary_content).expect("write fake binary");
 
         let archive_dir = tempfile::tempdir().expect("tempdir for archive itself");
-        let archive_path = archive_dir.path().join("drip-v0.1.0-x86_64-linux-gnu.tar.gz");
+        let archive_path = archive_dir.path().join("drip-x86_64-unknown-linux-gnu.tar.xz");
 
         let status = Command::new("tar")
-            .arg("-czf")
+            .arg("-cJf")
             .arg(&archive_path)
             .arg("-C")
             .arg(src_dir.path())
-            .arg("drip")
+            .arg(subdir_name)
             .status()
             .expect("failed to run tar to build the test fixture");
-        assert!(status.success(), "tar -czf should succeed building the fixture");
+        assert!(status.success(), "tar -cJf should succeed building the fixture");
 
         let dest_dir = tempfile::tempdir().expect("tempdir for extraction destination");
         let extracted = extract_binary(&archive_path, dest_dir.path())
             .expect("extract_binary should succeed");
 
-        assert_eq!(extracted, dest_dir.path().join("drip"));
+        assert_eq!(extracted, dest_dir.path().join(subdir_name).join("drip"));
         assert_eq!(extracted.file_name().unwrap(), "drip");
         let content = std::fs::read(&extracted).expect("extracted file should be readable");
         assert_eq!(content, binary_content);

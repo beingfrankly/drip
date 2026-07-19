@@ -899,11 +899,17 @@ fn handle_update(args: &UpdateArgs) -> Result<()> {
         return Ok(());
     }
 
-    let expected = update::expected_asset_name(&release.tag_name);
-    let asset = update::find_asset(&release, &expected).ok_or_else(|| {
+    let expected = update::expected_asset_name().ok_or_else(|| {
         anyhow::anyhow!(
-            "no release asset named '{expected}' was found for {} -- this platform may not be \
-             published yet",
+            "no prebuilt drip binary is published for your platform ({}/{}); install from source \
+             with `cargo install --path .` or download from the Releases page",
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        )
+    })?;
+    let asset = update::find_asset(&release, expected).ok_or_else(|| {
+        anyhow::anyhow!(
+            "release {} has no asset named '{expected}' (expected for this platform)",
             release.tag_name
         )
     })?;

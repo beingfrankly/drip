@@ -13,15 +13,19 @@ No Reddit API credentials, app registration, or API key of any kind is needed fo
 
 ### From a release binary
 
-Prebuilt binaries for Linux x86_64 (glibc) are attached to each [GitHub release](https://github.com/beingfrankly/drip/releases):
+Each [GitHub release](https://github.com/beingfrankly/drip/releases) ships prebuilt binaries for Linux (x86_64/glibc), macOS (x86_64 and Apple Silicon), and Windows (x86_64), plus a shell installer that picks the right one for your platform:
 
 ```bash
-curl -LO https://github.com/beingfrankly/drip/releases/latest/download/drip-vX.Y.Z-x86_64-linux-gnu.tar.gz
-tar -xzf drip-vX.Y.Z-x86_64-linux-gnu.tar.gz
-sudo mv drip /usr/local/bin/
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/beingfrankly/drip/releases/latest/download/drip-installer.sh | sh
 ```
 
-Replace `vX.Y.Z` with the version you want (check the releases page for the exact filename of the latest tag).
+Or grab the archive for your platform straight from the releases page — e.g. `drip-x86_64-unknown-linux-gnu.tar.xz` (Linux), `drip-aarch64-apple-darwin.tar.xz` (Apple Silicon), `drip-x86_64-pc-windows-msvc.zip` (Windows) — unpack it, and move the `drip` binary onto your `PATH`:
+
+```bash
+curl -LO https://github.com/beingfrankly/drip/releases/latest/download/drip-x86_64-unknown-linux-gnu.tar.xz
+tar -xf drip-x86_64-unknown-linux-gnu.tar.xz
+sudo mv drip-x86_64-unknown-linux-gnu/drip /usr/local/bin/
+```
 
 ### From source
 
@@ -42,7 +46,7 @@ drip update --check  # see if a newer version is available, without installing i
 drip update          # download and install it in place (asks for confirmation first; -y skips that)
 ```
 
-`drip update` replaces whichever binary is currently running (wherever it lives — `/usr/local/bin/drip`, `~/.cargo/bin/drip`, etc.) with the latest release from GitHub. It's Linux x86_64 only for now (that's the only platform released today).
+`drip update` replaces whichever binary is currently running (wherever it lives — `/usr/local/bin/drip`, `~/.cargo/bin/drip`, etc.) with the latest release from GitHub. It works on every platform drip publishes binaries for — Linux (x86_64), macOS (x86_64 and Apple Silicon), and Windows (x86_64) — downloading and unpacking the matching release archive in place. On any other platform it reports that no prebuilt binary is available and points you at `cargo install` / the releases page instead.
 
 ### From source
 
