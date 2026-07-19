@@ -17,6 +17,7 @@ mod update;
 mod youtube;
 
 use std::io::Write;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
@@ -179,6 +180,11 @@ fn truncate_to_limit(mut items: Vec<Item>, limit: u32) -> Vec<Item> {
     items
 }
 
+/// Delay inserted before each reddit feed request (after the first network
+/// request in a run) to avoid tripping Reddit's HTTP 429 rate limit when
+/// several reddit feeds are fetched back-to-back (bd issue drip-hja).
+const REDDIT_INTER_REQUEST_DELAY: Duration = Duration::from_secs(5);
+
 fn handle_fetch(args: &FetchArgs, config: &Config) -> Result<()> {
     vprintln(args.verbose, format!("parsed fetch args:\n{:#?}", args));
 
@@ -256,16 +262,35 @@ fn handle_fetch(args: &FetchArgs, config: &Config) -> Result<()> {
     let mut groups: Vec<(SourceGroup, Vec<Item>)> = Vec::new();
     let mut source_ids: std::collections::HashMap<(SourceKind, String), i64> =
         std::collections::HashMap::new();
+    // Tracks whether a network fetch has already happened THIS run, so the
+    // reddit inter-request throttle below never delays the very first fetch
+    // (nothing to space out from yet) -- only requests after it.
+    let mut made_request = false;
 
     if !sources_to_fetch.is_empty() {
         for label in &sources_to_fetch {
             match sources::find_by_label(&conn, label) {
                 Ok(Some(source_row)) => {
+                    // Only reddit feeds get throttled -- genuine RSS/YouTube
+                    // feeds have no known rate-limit problem, and delaying
+                    // them here would needlessly slow real fetches and the
+                    // mockito-based e2e tests (which use `SourceKind::Rss`).
+                    if made_request && source_row.kind == SourceKind::Reddit {
+                        vprintln(
+                            args.verbose,
+                            format!(
+                                "throttling: sleeping {}s before reddit fetch to avoid 429",
+                                REDDIT_INTER_REQUEST_DELAY.as_secs()
+                            ),
+                        );
+                        std::thread::sleep(REDDIT_INTER_REQUEST_DELAY);
+                    }
                     let fetch_result = match source_row.kind {
                         SourceKind::Rss | SourceKind::Youtube | SourceKind::Reddit => {
                             rss::fetch(&source_row.identifier, args.verbose)
                         }
                     };
+                    made_request = true;
                     match fetch_result {
                         Ok(items) => {
                             let items = truncate_to_limit(items, resolved.limit);
