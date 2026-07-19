@@ -180,10 +180,138 @@ fn truncate_to_limit(mut items: Vec<Item>, limit: u32) -> Vec<Item> {
     items
 }
 
-/// Delay inserted before each reddit feed request (after the first network
-/// request in a run) to avoid tripping Reddit's HTTP 429 rate limit when
-/// several reddit feeds are fetched back-to-back (bd issue drip-hja).
-const REDDIT_INTER_REQUEST_DELAY: Duration = Duration::from_secs(5);
+/// Pre-request spacing for a reddit fetch: `base` widened by accumulated 429
+/// "pressure" (the IP limit is global, so each 429 spaces out the REST of
+/// the run, not just retries of the source that got limited), clamped to a
+/// sane ceiling so a long run can never stall indefinitely (bd issue
+/// drip-6xz, follow-up to drip-hja's fixed, un-adaptive 5s throttle).
+/// `pressure` 0 -> `base` unchanged; 1 -> 2x; 2 -> 3x; etc.
+fn reddit_pre_request_delay(base: Duration, pressure: u32) -> Duration {
+    let widened = base.saturating_mul(1 + pressure);
+    widened.min(Duration::from_secs(60))
+}
+
+/// Outcome of fetching one saved source label, as aggregated by
+/// `fetch_one_source`'s caller in the two-pass coordinator below (bd issue
+/// drip-6xz). Keeps the per-source fetch body (lookup, throttle, `rss::fetch`,
+/// dedup, bookkeeping) written exactly once even though it now runs across
+/// up to two passes.
+enum SourceResult {
+    /// Fetched successfully (possibly zero new items after dedup).
+    Fetched {
+        group: SourceGroup,
+        items: Vec<Item>,
+        source_id: i64,
+    },
+    /// Still HTTP 429 after exhausting inline retries -- eligible for the
+    /// final retry pass.
+    RateLimited,
+    /// Any other failure, or an unknown/lookup-failed label -- not retried.
+    Skipped,
+}
+
+/// Fetch one saved source label: look it up, apply reddit pre-request
+/// spacing/throttle bookkeeping, call `rss::fetch`, and (on success) dedup
+/// against `seen_items` and print the same "fetched N (M new)" line the
+/// single-pass loop always has. Shared verbatim by both passes of the
+/// two-pass coordinator in `handle_fetch` so a rate-limited source retried
+/// in pass 2 goes through identical logic to pass 1 (bd issue drip-6xz).
+///
+/// `made_request`/`pressure` are threaded through by the caller (not stored
+/// here) because they need to persist across BOTH passes and across every
+/// source within a pass, not reset per-call.
+#[allow(clippy::too_many_arguments)]
+fn fetch_one_source(
+    conn: &Connection,
+    label: &str,
+    verbose: bool,
+    limit: u32,
+    delay: Duration,
+    retry_max: u32,
+    retry_base: Duration,
+    pressure: u32,
+    made_request: &mut bool,
+) -> SourceResult {
+    let source_row = match sources::find_by_label(conn, label) {
+        Ok(Some(row)) => row,
+        Ok(None) => {
+            eprintln!(
+                "warning: no saved source named '{label}' (run `drip source list` to see saved sources)"
+            );
+            return SourceResult::Skipped;
+        }
+        Err(err) => {
+            eprintln!("warning: failed to look up source '{label}': {err}");
+            return SourceResult::Skipped;
+        }
+    };
+
+    // Only reddit feeds get throttled -- genuine RSS/YouTube feeds have no
+    // known rate-limit problem, and delaying them here would needlessly
+    // slow real fetches and the mockito-based e2e tests (which use
+    // `SourceKind::Rss`).
+    if *made_request && source_row.kind == SourceKind::Reddit {
+        let sleep_for = reddit_pre_request_delay(delay, pressure);
+        vprintln(
+            verbose,
+            format!(
+                "throttling: sleeping {}s before reddit fetch to avoid 429 (pressure {pressure})",
+                sleep_for.as_secs()
+            ),
+        );
+        std::thread::sleep(sleep_for);
+    }
+
+    let outcome = match source_row.kind {
+        SourceKind::Rss | SourceKind::Youtube | SourceKind::Reddit => {
+            rss::fetch(&source_row.identifier, verbose, retry_max, retry_base)
+        }
+    };
+    *made_request = true;
+
+    match outcome {
+        rss::FetchOutcome::Fetched(items) => {
+            let items = truncate_to_limit(items, limit);
+            let total = items.len();
+            let filtered = match dedup::filter_unseen(conn, source_row.id, items) {
+                Ok(filtered) => filtered,
+                Err(err) => {
+                    eprintln!("warning: {label}: {err}");
+                    return SourceResult::Skipped;
+                }
+            };
+            let new = filtered.len();
+            let skipped = total - new;
+
+            if skipped > 0 {
+                println!("{label}: fetched {total} item(s), {new} new ({skipped} already seen)");
+            } else {
+                println!("{label}: fetched {new} item(s)");
+            }
+
+            SourceResult::Fetched {
+                group: SourceGroup {
+                    kind: source_row.kind,
+                    name: label.to_string(),
+                    topic: source_row.topic_name.clone(),
+                },
+                items: filtered,
+                source_id: source_row.id,
+            }
+        }
+        rss::FetchOutcome::RateLimited => {
+            eprintln!(
+                "warning: {label}: still rate-limited (HTTP 429) after retrying; will retry \
+                 again after a cooldown at the end of this run"
+            );
+            SourceResult::RateLimited
+        }
+        rss::FetchOutcome::Failed(err) => {
+            eprintln!("warning: {label}: {err}");
+            SourceResult::Skipped
+        }
+    }
+}
 
 fn handle_fetch(args: &FetchArgs, config: &Config) -> Result<()> {
     vprintln(args.verbose, format!("parsed fetch args:\n{:#?}", args));
@@ -262,70 +390,102 @@ fn handle_fetch(args: &FetchArgs, config: &Config) -> Result<()> {
     let mut groups: Vec<(SourceGroup, Vec<Item>)> = Vec::new();
     let mut source_ids: std::collections::HashMap<(SourceKind, String), i64> =
         std::collections::HashMap::new();
-    // Tracks whether a network fetch has already happened THIS run, so the
-    // reddit inter-request throttle below never delays the very first fetch
-    // (nothing to space out from yet) -- only requests after it.
+    // Tracks whether a network fetch has already happened THIS run (across
+    // BOTH passes), so the reddit throttle below never delays the very
+    // first fetch (nothing to space out from yet) -- only requests after
+    // it.
     let mut made_request = false;
+    // Accumulated 429 "pressure" for this run -- widens reddit spacing for
+    // every request after a rate-limit hit, since the limit is per-IP
+    // global rather than per-subreddit (bd issue drip-6xz). Capped well
+    // below `reddit_pre_request_delay`'s own 60s ceiling so it can't grow
+    // unboundedly across a long run.
+    let mut pressure: u32 = 0;
+    let delay = Duration::from_secs(settings.reddit_request_delay_secs as u64);
+    let retry_max = settings.reddit_retry_max;
+    let retry_base = Duration::from_secs(settings.reddit_retry_base_secs as u64);
 
-    if !sources_to_fetch.is_empty() {
-        for label in &sources_to_fetch {
-            match sources::find_by_label(&conn, label) {
-                Ok(Some(source_row)) => {
-                    // Only reddit feeds get throttled -- genuine RSS/YouTube
-                    // feeds have no known rate-limit problem, and delaying
-                    // them here would needlessly slow real fetches and the
-                    // mockito-based e2e tests (which use `SourceKind::Rss`).
-                    if made_request && source_row.kind == SourceKind::Reddit {
-                        vprintln(
-                            args.verbose,
-                            format!(
-                                "throttling: sleeping {}s before reddit fetch to avoid 429",
-                                REDDIT_INTER_REQUEST_DELAY.as_secs()
-                            ),
-                        );
-                        std::thread::sleep(REDDIT_INTER_REQUEST_DELAY);
-                    }
-                    let fetch_result = match source_row.kind {
-                        SourceKind::Rss | SourceKind::Youtube | SourceKind::Reddit => {
-                            rss::fetch(&source_row.identifier, args.verbose)
-                        }
-                    };
-                    made_request = true;
-                    match fetch_result {
-                        Ok(items) => {
-                            let items = truncate_to_limit(items, resolved.limit);
-                            let total = items.len();
-                            let filtered =
-                                dedup::filter_unseen(&conn, source_row.id, items)?;
-                            let new = filtered.len();
-                            let skipped = total - new;
-
-                            if skipped > 0 {
-                                println!(
-                                    "{label}: fetched {total} item(s), {new} new ({skipped} already seen)"
-                                );
-                            } else {
-                                println!("{label}: fetched {new} item(s)");
-                            }
-
-                            source_ids.insert((source_row.kind, label.clone()), source_row.id);
-                            groups.push((
-                                SourceGroup {
-                                    kind: source_row.kind,
-                                    name: label.clone(),
-                                    topic: source_row.topic_name.clone(),
-                                },
-                                filtered,
-                            ));
-                        }
-                        Err(err) => eprintln!("warning: {label}: {err}"),
-                    }
-                }
-                Ok(None) => eprintln!(
-                    "warning: no saved source named '{label}' (run `drip source list` to see saved sources)"
-                ),
-                Err(err) => eprintln!("warning: failed to look up source '{label}': {err}"),
+    // Pass 1: fetch every requested source once. Anything still
+    // `RateLimited` after exhausting `rss::fetch`'s own inline retries is
+    // collected for a final retry pass below, rather than dropped for the
+    // run outright (bd issue drip-6xz).
+    let mut rate_limited: Vec<String> = Vec::new();
+    for label in &sources_to_fetch {
+        match fetch_one_source(
+            &conn,
+            label,
+            args.verbose,
+            resolved.limit,
+            delay,
+            retry_max,
+            retry_base,
+            pressure,
+            &mut made_request,
+        ) {
+            SourceResult::Fetched {
+                group,
+                items,
+                source_id,
+            } => {
+                source_ids.insert((group.kind, group.name.clone()), source_id);
+                groups.push((group, items));
             }
+            SourceResult::RateLimited => {
+                pressure = (pressure + 1).min(8);
+                rate_limited.push(label.clone());
+            }
+            SourceResult::Skipped => {}
+        }
+    }
+
+    // Pass 2: a longer cooldown, then retry exactly the sources that were
+    // still rate-limited after pass 1's own inline retries -- the IP-global
+    // limit means the whole run needs to breathe, not just the one source
+    // that got 429'd (bd issue drip-6xz).
+    if !rate_limited.is_empty() {
+        let cooldown = delay.saturating_mul(3).max(Duration::from_secs(30));
+        println!(
+            "{} source(s) rate-limited; cooling down {}s then retrying: {}",
+            rate_limited.len(),
+            cooldown.as_secs(),
+            rate_limited.join(", ")
+        );
+        std::thread::sleep(cooldown);
+
+        let retry_queue = std::mem::take(&mut rate_limited);
+        for label in &retry_queue {
+            match fetch_one_source(
+                &conn,
+                label,
+                args.verbose,
+                resolved.limit,
+                delay,
+                retry_max,
+                retry_base,
+                pressure,
+                &mut made_request,
+            ) {
+                SourceResult::Fetched {
+                    group,
+                    items,
+                    source_id,
+                } => {
+                    source_ids.insert((group.kind, group.name.clone()), source_id);
+                    groups.push((group, items));
+                }
+                SourceResult::RateLimited => {
+                    pressure = (pressure + 1).min(8);
+                    rate_limited.push(label.clone());
+                }
+                SourceResult::Skipped => {}
+            }
+        }
+
+        for label in &rate_limited {
+            eprintln!(
+                "warning: {label}: still rate-limited after the final retry pass; it will be \
+                 picked up on the next run (dedup avoids duplicates)"
+            );
         }
     }
 
@@ -1112,6 +1272,32 @@ mod tests {
         let truncated = truncate_to_limit(items.clone(), 10);
 
         assert_eq!(truncated, items);
+    }
+
+    #[test]
+    fn reddit_pre_request_delay_widens_with_pressure_and_clamps_to_a_ceiling() {
+        let base = Duration::from_secs(10);
+
+        assert_eq!(
+            reddit_pre_request_delay(base, 0),
+            base,
+            "zero pressure should leave the base delay unchanged"
+        );
+        assert_eq!(
+            reddit_pre_request_delay(base, 1),
+            Duration::from_secs(20),
+            "pressure 1 should double the base delay"
+        );
+        assert_eq!(
+            reddit_pre_request_delay(base, 2),
+            Duration::from_secs(30),
+            "pressure 2 should triple the base delay"
+        );
+        assert_eq!(
+            reddit_pre_request_delay(base, 100),
+            Duration::from_secs(60),
+            "a large pressure should clamp to the 60s ceiling, not grow unboundedly"
+        );
     }
 
     /// A fresh, temp-dir-backed `Config` for `handle_topic` end-to-end

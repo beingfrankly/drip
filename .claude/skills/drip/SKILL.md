@@ -87,7 +87,8 @@ Flags:
 
 - `show` — print current configuration (`config.toml` + settings).
 - `edit` — open `config.toml` in `$EDITOR`.
-- `set <key> <value>` — set one SQLite-backed setting. Valid keys: `posts_folder`, `daily_notes_folder`, `daily_note_format`, `default_sort`, `default_limit`, `default_tags`.
+- `set <key> <value>` — set one SQLite-backed setting. Valid keys: `posts_folder`, `daily_notes_folder`, `daily_note_format`, `default_sort`, `default_limit`, `default_tags`, `reddit_request_delay_secs`, `reddit_retry_max`, `reddit_retry_base_secs`.
+  - `reddit_request_delay_secs` (default `10`), `reddit_retry_max` (default `4`), `reddit_retry_base_secs` (default `5`) tune how `drip fetch` paces reddit requests to avoid HTTP 429 rate-limiting — see the reddit-throttling gotcha below.
 
 ### `drip update [--check] [-y]`
 
@@ -113,6 +114,7 @@ The checkbox items are the point: they're plain Obsidian tasks, surfaced elsewhe
 - **`--tag` on `fetch` adds real Obsidian tags** to the digest note (not just a label), unlike `--sort`/`--time`/`--query`.
 - **The digest filename only uses the topic's name when exactly one `--topic` is given and it resolves cleanly.** With zero topics it falls back to the joined source labels; with a `--topic` name that failed to resolve (e.g. a typo) it also falls back to the joined source labels; with more than one `--topic` it joins the topic names themselves (not their member source labels).
 - **Every source belongs to exactly one topic — there's no multi-assign.** `drip source add` requires `--topic`, and reassigning is `drip source move --name <label> --topic <name>`, not an "add to another topic" operation. `drip topic remove` refuses while it still owns any sources (move them out first); an empty topic can always be removed, and doing so never deletes the sources that were in it.
+- **Reddit fetches are throttled + retried to dodge HTTP 429 (per-IP, global).** `drip fetch` spaces reddit requests `reddit_request_delay_secs` apart (default 10s), widening after each 429 it sees ("pressure"), retries a 429 up to `reddit_retry_max` times (default 4, honoring `Retry-After` then exponential backoff with base `reddit_retry_base_secs`, default 5s), and runs a **final retry pass** over any source still rate-limited after a longer cooldown. Anything still 429 after that is skipped for the run and picked up next run (dedup avoids dupes). RSS/YouTube feeds are never throttled. Tune via `drip config set reddit_request_delay_secs <n>` etc. if you fetch many reddit sources at once.
 
 ## Example workflow
 

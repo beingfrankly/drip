@@ -11,7 +11,7 @@
 
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
+use anyhow::anyhow;
 use feed_rs::model::Entry;
 use reqwest::blocking::Client;
 use reqwest::header::USER_AGENT;
@@ -19,12 +19,27 @@ use reqwest::header::USER_AGENT;
 use crate::item::Item;
 use crate::vprintln;
 
-/// Max retry attempts after an initial HTTP 429 before giving up.
-const MAX_RETRIES: u32 = 3;
-/// Base delay for exponential backoff when no Retry-After header is present.
-const RETRY_BASE_DELAY: Duration = Duration::from_secs(4);
 /// Hard cap on any single backoff wait (also clamps a large Retry-After).
 const RETRY_MAX_DELAY: Duration = Duration::from_secs(120);
+
+/// The outcome of a single [`fetch`] call. Reddit rate-limits per-IP
+/// GLOBALLY across its `.rss` endpoints (bd issue drip-6xz, follow-up to
+/// drip-hja), so a source that's still 429-ing after exhausting its own
+/// inline retries needs to be distinguishable from any other failure --
+/// `handle_fetch`'s coordinator (`src/main.rs`) uses that distinction to
+/// widen spacing for the rest of the run and to queue the source for a
+/// final retry pass, rather than dropping it for the run the way a genuine
+/// error is.
+#[derive(Debug)]
+pub enum FetchOutcome {
+    /// The feed was fetched and parsed successfully.
+    Fetched(Vec<Item>),
+    /// Still HTTP 429 after exhausting `max_retries` inline retries.
+    RateLimited,
+    /// Any other failure: transport error, a non-429 non-2xx status, or a
+    /// response body that didn't parse as RSS/Atom.
+    Failed(anyhow::Error),
+}
 
 /// Compute how long to wait before retrying after a 429. Honors an explicit
 /// Retry-After (integer seconds) when present; otherwise exponential backoff
@@ -45,47 +60,54 @@ fn retry_delay(attempt: u32, retry_after_secs: Option<u64>, base: Duration) -> D
     }
 }
 
-/// Fetch and parse the RSS/Atom feed at `url`, returning its entries mapped
-/// to [`Item`]s in feed order.
+/// Fetch and parse the RSS/Atom feed at `url`, returning a [`FetchOutcome`]
+/// rather than a plain `Result` (bd issue drip-6xz) -- the caller
+/// (`handle_fetch`'s coordinator in `src/main.rs`) needs to distinguish
+/// "still rate-limited after retrying" from any other failure, since only
+/// the former gets a final retry pass at the end of the run.
 ///
-/// Surfaces a clear error for a non-2xx HTTP response and for a response
-/// body that isn't parseable as RSS/Atom (e.g. an HTML error page, or
-/// unrelated content at that URL) -- neither case panics.
-///
-/// A 429 (rate-limited) response is retried up to [`MAX_RETRIES`] times,
+/// A 429 (rate-limited) response is retried up to `max_retries` times,
 /// honoring a `Retry-After` header when the server sends one and falling
-/// back to exponential backoff otherwise (bd issue drip-hja) -- see
-/// [`fetch_with_retry`]/[`retry_delay`] for the mechanics.
-pub fn fetch(url: &str, verbose: bool) -> Result<Vec<Item>> {
-    fetch_with_retry(url, verbose, MAX_RETRIES, RETRY_BASE_DELAY)
-}
-
-/// The actual fetch + retry loop behind [`fetch`], parameterized on the
-/// retry policy so tests can drive it with a near-zero `base` delay instead
-/// of waiting on real backoff timers.
-fn fetch_with_retry(
-    url: &str,
-    verbose: bool,
-    max_retries: u32,
-    base: Duration,
-) -> Result<Vec<Item>> {
+/// back to exponential backoff (base `base`) otherwise (bd issue drip-hja)
+/// -- see [`retry_delay`] for the mechanics. `max_retries`/`base` come from
+/// the caller's resolved `settings.reddit_retry_max`/
+/// `reddit_retry_base_secs` (drip-6xz made these configurable rather than
+/// fixed consts, since a single hardcoded policy proved too tight against
+/// reddit's global per-IP limit).
+///
+/// A transport-level send error (DNS, connection refused, timeout, ...)
+/// never retries -- unlike a 429, there's no reason to expect a second
+/// attempt moments later to succeed.
+pub fn fetch(url: &str, verbose: bool, max_retries: u32, base: Duration) -> FetchOutcome {
     // Without an explicit timeout, a slow or hanging feed URL (arbitrary,
     // user-supplied via `drip source add --url <url>`) would block `drip
     // fetch` indefinitely. 30 seconds is generous for a feed fetch while
     // still bounding the worst case.
-    let http = Client::builder()
-        .timeout(Duration::from_secs(30))
-        .build()
-        .context("failed to build HTTP client for RSS/Atom fetch")?;
+    let http = match Client::builder().timeout(Duration::from_secs(30)).build() {
+        Ok(http) => http,
+        Err(err) => {
+            return FetchOutcome::Failed(
+                anyhow::Error::new(err)
+                    .context("failed to build HTTP client for RSS/Atom fetch"),
+            )
+        }
+    };
 
     for attempt in 0..=max_retries {
         vprintln(verbose, format!("GET {url}"));
 
-        let resp = http
+        let resp = match http
             .get(url)
             .header(USER_AGENT, "drip/0.1 (RSS reader)")
             .send()
-            .with_context(|| format!("failed to fetch feed at {url}"))?;
+        {
+            Ok(resp) => resp,
+            Err(err) => {
+                return FetchOutcome::Failed(
+                    anyhow::Error::new(err).context(format!("failed to fetch feed at {url}")),
+                )
+            }
+        };
 
         let status = resp.status();
 
@@ -109,26 +131,35 @@ fn fetch_with_retry(
                 std::thread::sleep(delay);
                 continue;
             }
-            bail!("failed to fetch feed at {url}: HTTP {status}");
+            return FetchOutcome::RateLimited;
         }
 
         if !status.is_success() {
-            bail!("failed to fetch feed at {url}: HTTP {status}");
+            return FetchOutcome::Failed(anyhow!("failed to fetch feed at {url}: HTTP {status}"));
         }
 
-        let bytes = resp
-            .bytes()
-            .with_context(|| format!("failed to read response body from {url}"))?;
+        let bytes = match resp.bytes() {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                return FetchOutcome::Failed(
+                    anyhow::Error::new(err)
+                        .context(format!("failed to read response body from {url}")),
+                )
+            }
+        };
 
-        let feed = feed_rs::parser::parse(bytes.as_ref())
-            .with_context(|| format!("failed to parse feed at {url} as RSS/Atom"))?;
-
-        return Ok(feed.entries.into_iter().map(entry_to_item).collect());
+        return match feed_rs::parser::parse(bytes.as_ref()) {
+            Ok(feed) => FetchOutcome::Fetched(feed.entries.into_iter().map(entry_to_item).collect()),
+            Err(err) => FetchOutcome::Failed(
+                anyhow::Error::new(err).context(format!("failed to parse feed at {url} as RSS/Atom")),
+            ),
+        };
     }
 
-    // Unreachable: the loop above always either returns or bails before
-    // falling off the end (the `attempt == max_retries` branch bails).
-    unreachable!("fetch retry loop should always return or bail")
+    // Unreachable: the loop above always either returns before falling off
+    // the end (the `attempt == max_retries` 429 branch returns
+    // `RateLimited`).
+    unreachable!("fetch retry loop should always return")
 }
 
 /// Map a single `feed_rs::model::Entry` to our normalized [`Item`] shape.
@@ -206,8 +237,12 @@ mod tests {
             .create();
 
         let url = format!("{}/feed.xml", server.url());
-        let items = fetch(&url, false).expect("fetch should succeed against the mock server");
+        let outcome = fetch(&url, false, 3, Duration::from_millis(0));
 
+        let items = match outcome {
+            FetchOutcome::Fetched(items) => items,
+            other => panic!("expected Fetched, got a different outcome: {other:?}"),
+        };
         assert_eq!(items.len(), 1);
         let item = &items[0];
         assert_eq!(item.id, "https://example.com/posts/first");
@@ -231,8 +266,12 @@ mod tests {
             .create();
 
         let url = format!("{}/feed.atom", server.url());
-        let items = fetch(&url, false).expect("fetch should succeed against the mock server");
+        let outcome = fetch(&url, false, 3, Duration::from_millis(0));
 
+        let items = match outcome {
+            FetchOutcome::Fetched(items) => items,
+            other => panic!("expected Fetched, got a different outcome: {other:?}"),
+        };
         assert_eq!(items.len(), 1);
         let item = &items[0];
         assert_eq!(item.id, "https://example.com/posts/atom-first");
@@ -255,8 +294,12 @@ mod tests {
             .create();
 
         let url = format!("{}/feed.xml", server.url());
-        let err = fetch(&url, false).expect_err("a 404 response should produce an error");
+        let outcome = fetch(&url, false, 3, Duration::from_millis(0));
 
+        let err = match outcome {
+            FetchOutcome::Failed(err) => err,
+            other => panic!("expected Failed, got a different outcome: {other:?}"),
+        };
         assert!(
             err.to_string().contains("404"),
             "error should mention the HTTP status: {err}"
@@ -274,8 +317,12 @@ mod tests {
             .create();
 
         let url = format!("{}/feed.xml", server.url());
-        let err = fetch(&url, false).expect_err("malformed feed content should produce an error");
+        let outcome = fetch(&url, false, 3, Duration::from_millis(0));
 
+        let err = match outcome {
+            FetchOutcome::Failed(err) => err,
+            other => panic!("expected Failed, got a different outcome: {other:?}"),
+        };
         assert!(
             err.to_string().contains("parse"),
             "error should mention parsing failed: {err}"
@@ -315,7 +362,7 @@ mod tests {
     }
 
     #[test]
-    fn fetch_with_retry_succeeds_after_a_single_429() {
+    fn fetch_succeeds_after_a_single_429() {
         let mut server = mockito::Server::new();
         let rate_limited = server
             .mock("GET", "/feed.xml")
@@ -329,9 +376,14 @@ mod tests {
             .create();
 
         let url = format!("{}/feed.xml", server.url());
-        let items = fetch_with_retry(&url, false, 3, Duration::from_millis(0))
-            .expect("fetch should succeed after retrying past the 429");
+        let outcome = fetch(&url, false, 3, Duration::from_millis(0));
 
+        let items = match outcome {
+            FetchOutcome::Fetched(items) => items,
+            other => panic!(
+                "fetch should succeed after retrying past the 429, got: {other:?}"
+            ),
+        };
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].title, "First RSS post");
         rate_limited.assert();
@@ -339,7 +391,7 @@ mod tests {
     }
 
     #[test]
-    fn fetch_with_retry_gives_up_after_exhausting_retries_on_persistent_429() {
+    fn fetch_reports_rate_limited_after_exhausting_retries_on_persistent_429() {
         let mut server = mockito::Server::new();
         let max_retries = 2;
         let rate_limited = server
@@ -349,18 +401,17 @@ mod tests {
             .create();
 
         let url = format!("{}/feed.xml", server.url());
-        let err = fetch_with_retry(&url, false, max_retries, Duration::from_millis(0))
-            .expect_err("persistent 429s should eventually give up");
+        let outcome = fetch(&url, false, max_retries, Duration::from_millis(0));
 
         assert!(
-            err.to_string().contains("429"),
-            "error should mention the HTTP status: {err}"
+            matches!(outcome, FetchOutcome::RateLimited),
+            "persistent 429s should eventually report RateLimited, got: {outcome:?}"
         );
         rate_limited.assert();
     }
 
     #[test]
-    fn fetch_with_retry_honors_a_zero_second_retry_after() {
+    fn fetch_honors_a_zero_second_retry_after() {
         let mut server = mockito::Server::new();
         let rate_limited = server
             .mock("GET", "/feed.xml")
@@ -375,9 +426,14 @@ mod tests {
             .create();
 
         let url = format!("{}/feed.xml", server.url());
-        let items = fetch_with_retry(&url, false, 3, Duration::from_secs(60))
-            .expect("a Retry-After: 0 header should be honored instead of the exponential base");
+        let outcome = fetch(&url, false, 3, Duration::from_secs(60));
 
+        let items = match outcome {
+            FetchOutcome::Fetched(items) => items,
+            other => panic!(
+                "a Retry-After: 0 header should be honored instead of the exponential base, got: {other:?}"
+            ),
+        };
         assert_eq!(items.len(), 1);
         rate_limited.assert();
         ok.assert();

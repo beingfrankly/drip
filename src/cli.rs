@@ -144,10 +144,13 @@ pub enum ConfigAction {
     /// Open the configuration file in an editor
     Edit,
     /// Set a database-backed setting (posts_folder, daily_notes_folder,
-    /// daily_note_format, default_sort, default_limit, default_tags)
+    /// daily_note_format, default_sort, default_limit, default_tags,
+    /// reddit_request_delay_secs, reddit_retry_max, reddit_retry_base_secs)
     Set {
         /// Setting name (posts_folder, daily_notes_folder,
-        /// daily_note_format, default_sort, default_limit, default_tags)
+        /// daily_note_format, default_sort, default_limit, default_tags,
+        /// reddit_request_delay_secs, reddit_retry_max,
+        /// reddit_retry_base_secs)
         key: String,
         /// New value for the setting
         value: String,

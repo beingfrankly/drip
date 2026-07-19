@@ -15,15 +15,18 @@ use rusqlite::{params, Connection};
 
 use crate::types::Sort;
 
-/// The six known setting keys. Exposed so callers (e.g. the `drip config
+/// The nine known setting keys. Exposed so callers (e.g. the `drip config
 /// set` CLI validator) can list valid keys without duplicating this list.
-pub const KEYS: [&str; 6] = [
+pub const KEYS: [&str; 9] = [
     "posts_folder",
     "daily_notes_folder",
     "daily_note_format",
     "default_sort",
     "default_limit",
     "default_tags",
+    "reddit_request_delay_secs",
+    "reddit_retry_max",
+    "reddit_retry_base_secs",
 ];
 
 /// The settings-table-backed configuration fields that used to live on
@@ -36,6 +39,21 @@ pub struct Settings {
     pub default_sort: Sort,
     pub default_limit: u32,
     pub default_tags: Vec<String>,
+    /// Base pre-request delay (seconds) before each reddit feed fetch, in a
+    /// run with two or more reddit sources (bd issue drip-6xz, follow-up to
+    /// drip-hja's fixed 5s throttle -- reddit rate-limits per-IP globally
+    /// across its `.rss` endpoints, so 5s proved too tight). Widened
+    /// adaptively per-run on a 429 -- see `main.rs`'s
+    /// `reddit_pre_request_delay`.
+    pub reddit_request_delay_secs: u32,
+    /// Max retry attempts after an initial HTTP 429 on a single reddit/RSS
+    /// fetch before that source is reported `RateLimited` for this pass (bd
+    /// issue drip-6xz).
+    pub reddit_retry_max: u32,
+    /// Base delay (seconds) for a single fetch's exponential 429 backoff
+    /// when no `Retry-After` header is present (bd issue drip-6xz) -- see
+    /// `rss::retry_delay`.
+    pub reddit_retry_base_secs: u32,
 }
 
 fn default_posts_folder() -> String {
@@ -60,6 +78,18 @@ fn default_limit() -> u32 {
 
 fn default_tags() -> Vec<String> {
     vec!["reddit".to_string()]
+}
+
+fn default_reddit_request_delay_secs() -> u32 {
+    10
+}
+
+fn default_reddit_retry_max() -> u32 {
+    4
+}
+
+fn default_reddit_retry_base_secs() -> u32 {
+    5
 }
 
 /// Read the raw text value stored for `key`, if any. This is the low-level
@@ -93,14 +123,14 @@ pub fn set_raw(conn: &Connection, key: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
-/// Seed any of the six known setting keys that are MISSING with their
+/// Seed any of the nine known setting keys that are MISSING with their
 /// hardcoded defaults, via `INSERT OR IGNORE` so an already-present value
 /// (e.g. one a user customized) is never clobbered. Safe to call on every
 /// [`load`] -- a fresh DB gets a complete set of defaults, and a DB that
 /// predates a newly-added setting key in some future version gets just the
 /// missing key filled in.
 fn seed_missing(conn: &Connection) -> Result<()> {
-    let defaults: [(&str, String); 6] = [
+    let defaults: [(&str, String); 9] = [
         ("posts_folder", default_posts_folder()),
         ("daily_notes_folder", default_daily_notes_folder()),
         ("daily_note_format", default_daily_note_format()),
@@ -110,6 +140,15 @@ fn seed_missing(conn: &Connection) -> Result<()> {
             "default_tags",
             serde_json::to_string(&default_tags())
                 .context("failed to encode default tags as JSON")?,
+        ),
+        (
+            "reddit_request_delay_secs",
+            default_reddit_request_delay_secs().to_string(),
+        ),
+        ("reddit_retry_max", default_reddit_retry_max().to_string()),
+        (
+            "reddit_retry_base_secs",
+            default_reddit_retry_base_secs().to_string(),
         ),
     ];
 
@@ -154,6 +193,31 @@ pub fn load(conn: &Connection) -> Result<Settings> {
         format!("stored 'default_tags' setting '{default_tags_raw}' is not valid JSON")
     })?;
 
+    let reddit_request_delay_secs_raw = get_raw(conn, "reddit_request_delay_secs")?
+        .context("missing 'reddit_request_delay_secs' setting after seeding defaults")?;
+    let reddit_request_delay_secs: u32 =
+        reddit_request_delay_secs_raw.parse().with_context(|| {
+            format!(
+                "stored 'reddit_request_delay_secs' setting '{reddit_request_delay_secs_raw}' \
+                 is not a valid number"
+            )
+        })?;
+
+    let reddit_retry_max_raw = get_raw(conn, "reddit_retry_max")?
+        .context("missing 'reddit_retry_max' setting after seeding defaults")?;
+    let reddit_retry_max: u32 = reddit_retry_max_raw.parse().with_context(|| {
+        format!("stored 'reddit_retry_max' setting '{reddit_retry_max_raw}' is not a valid number")
+    })?;
+
+    let reddit_retry_base_secs_raw = get_raw(conn, "reddit_retry_base_secs")?
+        .context("missing 'reddit_retry_base_secs' setting after seeding defaults")?;
+    let reddit_retry_base_secs: u32 = reddit_retry_base_secs_raw.parse().with_context(|| {
+        format!(
+            "stored 'reddit_retry_base_secs' setting '{reddit_retry_base_secs_raw}' is not a \
+             valid number"
+        )
+    })?;
+
     Ok(Settings {
         posts_folder,
         daily_notes_folder,
@@ -161,14 +225,18 @@ pub fn load(conn: &Connection) -> Result<Settings> {
         default_sort,
         default_limit,
         default_tags,
+        reddit_request_delay_secs,
+        reddit_retry_max,
+        reddit_retry_base_secs,
     })
 }
 
-/// Validate that `key` is one of the six known setting names, and that
+/// Validate that `key` is one of the nine known setting names, and that
 /// `value` parses correctly for that key's type, returning the encoded
 /// string that should actually be stored (identical to `value` for the
 /// plain string keys; a normalized encoding for
-/// `default_sort`/`default_limit`/`default_tags`).
+/// `default_sort`/`default_limit`/`default_tags`/
+/// `reddit_request_delay_secs`/`reddit_retry_max`/`reddit_retry_base_secs`).
 ///
 /// Used by the `drip config set` CLI handler so invalid input never reaches
 /// the database, even though `value` is a plain TEXT column that would
@@ -197,6 +265,30 @@ pub fn validate_and_encode(key: &str, value: &str) -> Result<String> {
                 )
             })?;
             serde_json::to_string(&tags).context("failed to re-encode default tags as JSON")
+        }
+        "reddit_request_delay_secs" => {
+            let secs: u32 = value.parse().with_context(|| {
+                format!(
+                    "'{value}' is not a valid delay (expected a non-negative whole number of \
+                     seconds)"
+                )
+            })?;
+            Ok(secs.to_string())
+        }
+        "reddit_retry_max" => {
+            let max: u32 = value.parse().with_context(|| {
+                format!("'{value}' is not a valid retry count (expected a non-negative whole number)")
+            })?;
+            Ok(max.to_string())
+        }
+        "reddit_retry_base_secs" => {
+            let secs: u32 = value.parse().with_context(|| {
+                format!(
+                    "'{value}' is not a valid delay (expected a non-negative whole number of \
+                     seconds)"
+                )
+            })?;
+            Ok(secs.to_string())
         }
         other => {
             anyhow::bail!(
@@ -236,6 +328,9 @@ mod tests {
         assert_eq!(settings.default_sort, Sort::Hot);
         assert_eq!(settings.default_limit, 10);
         assert_eq!(settings.default_tags, vec!["reddit".to_string()]);
+        assert_eq!(settings.reddit_request_delay_secs, 10);
+        assert_eq!(settings.reddit_retry_max, 4);
+        assert_eq!(settings.reddit_retry_base_secs, 5);
     }
 
     #[test]
@@ -310,5 +405,16 @@ mod tests {
 
         let err = validate_and_encode("default_sort", "bogus").expect_err("should error");
         assert!(err.to_string().contains("not a valid sort"));
+    }
+
+    #[test]
+    fn validate_and_encode_accepts_valid_reddit_request_delay_secs_and_rejects_non_number() {
+        let encoded =
+            validate_and_encode("reddit_request_delay_secs", "15").expect("should be valid");
+        assert_eq!(encoded, "15");
+
+        let err = validate_and_encode("reddit_request_delay_secs", "not-a-number")
+            .expect_err("should error");
+        assert!(err.to_string().contains("not a valid delay"));
     }
 }

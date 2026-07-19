@@ -184,6 +184,14 @@ Note: `--sort`/`--time`/`-q`/`--query` on `drip fetch` only label the digest not
 
 Note: `drip fetch` remembers what it's already shown you, per source — an item that appeared in a previous digest won't be included again. If a fetch turns up nothing new, `drip` says so and skips writing a digest note.
 
+When a fetch includes multiple Reddit sources, `drip` paces the requests to dodge Reddit's per-IP (global) HTTP 429 rate-limiting: it spaces reddit requests `reddit_request_delay_secs` apart (default `10`, widening after each 429 it sees), retries a rate-limited request up to `reddit_retry_max` times (default `4`, honoring a `Retry-After` header then falling back to exponential backoff with base `reddit_retry_base_secs`, default `5`), and runs one **final retry pass** over any source still limited after a short cooldown. Anything still limited after that is skipped for the run and picked up next time (dedup avoids duplicates). RSS/YouTube feeds are never throttled. Tune the pacing without a rebuild:
+
+```bash
+drip config set reddit_request_delay_secs 15   # more space between reddit requests
+drip config set reddit_retry_max 5
+drip config set reddit_retry_base_secs 6
+```
+
 View or edit the config file directly:
 
 ```bash
