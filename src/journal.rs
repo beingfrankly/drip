@@ -205,6 +205,7 @@ mod tests {
         SourceGroup {
             kind: SourceKind::Reddit,
             name: name.to_string(),
+            topic: "Programming".to_string(),
         }
     }
 
@@ -387,6 +388,7 @@ mod tests {
         let rss_group = SourceGroup {
             kind: SourceKind::Rss,
             name: "rust-blog".to_string(),
+            topic: "Programming".to_string(),
         };
 
         let bullet = digest_bullet("digest", &[rss_group], 2);

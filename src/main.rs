@@ -140,9 +140,10 @@ fn resolve_topic_labels(conn: &Connection, topic_names: &[String]) -> (Vec<Strin
                 for member in members {
                     match member.display_name {
                         Some(label) => labels.push(label),
-                        // Every member of a topic was attached via
-                        // `add_source_to_topic`, which requires a
-                        // labeled (`find_by_label`-resolved) source, so
+                        // Every member of a topic was assigned via
+                        // `drip source add`'s `--topic` or `drip source
+                        // move` (`topics::move_source_to_topic`), both of
+                        // which require a labeled source, so
                         // `display_name` should always be `Some` here. A
                         // `None` would mean the data itself is
                         // inconsistent, not that the user did anything
@@ -287,6 +288,7 @@ fn handle_fetch(args: &FetchArgs, config: &Config) -> Result<()> {
                                 SourceGroup {
                                     kind: source_row.kind,
                                     name: label.clone(),
+                                    topic: source_row.topic_name.clone(),
                                 },
                                 filtered,
                             ));
@@ -728,9 +730,10 @@ fn handle_config(action: &ConfigAction, config: &Config) -> Result<()> {
     Ok(())
 }
 
-/// Handle `drip source add/remove/list` (drip-15n.9.6): CRUD over the
+/// Handle `drip source add/move/remove/list` (drip-15n.9.6, extended by bd
+/// issue drip-38w.2 for the one-topic-per-source model): CRUD over the
 /// labeled, non-Reddit sources managed via `src/sources.rs`'s labeled-CRUD
-/// functions.
+/// functions, plus reassigning a source's topic.
 fn handle_source(action: &SourceAction, config: &Config) -> Result<()> {
     let conn = db::open(config)?;
     match action {
@@ -745,13 +748,22 @@ fn handle_source(action: &SourceAction, config: &Config) -> Result<()> {
                     args.search.as_deref(),
                 )?,
             };
-            sources::upsert_source(&conn, args.kind, &identifier, Some(&args.name))?;
+            // `drip source add` requires an already-existing topic (bd issue
+            // drip-38w.2) -- it does NOT auto-create one, unlike the
+            // drip-38w.1 interim "Uncategorized" default this replaces.
+            let topic_id = topics::require_topic_id(&conn, &args.topic)?;
+            sources::upsert_source(&conn, args.kind, &identifier, Some(&args.name), topic_id)?;
             println!(
-                "saved source '{}' (kind: {}, url: {})",
+                "saved source '{}' (topic: {}, kind: {}, url: {})",
                 args.name,
+                args.topic,
                 args.kind.as_str(),
                 identifier
             );
+        }
+        SourceAction::Move { name, topic } => {
+            topics::move_source_to_topic(&conn, topic, name)?;
+            println!("moved source '{name}' to topic '{topic}'");
         }
         SourceAction::Remove { name } => {
             if sources::remove_by_label(&conn, name)? {
@@ -767,8 +779,9 @@ fn handle_source(action: &SourceAction, config: &Config) -> Result<()> {
             } else {
                 for row in &saved {
                     println!(
-                        "- {} (kind: {}, url: {})",
+                        "- {} (topic: {}, kind: {}, url: {})",
                         row.display_name.as_deref().unwrap_or("?"),
+                        row.topic_name,
                         row.kind.as_str(),
                         row.identifier
                     );
@@ -779,9 +792,12 @@ fn handle_source(action: &SourceAction, config: &Config) -> Result<()> {
     Ok(())
 }
 
-/// Handle `drip topic add/add-source/remove-source/remove/list` (bd issue
-/// drip-p6v.6): CRUD over topics and their source membership, via
-/// `src/topics.rs`'s labeled-CRUD functions.
+/// Handle `drip topic add/remove/list` (bd issue drip-p6v.6, narrowed by bd
+/// issue drip-38w.2 for the one-topic-per-source model): CRUD over topics
+/// themselves, via `src/topics.rs`'s labeled-CRUD functions. Source-topic
+/// assignment now happens at `drip source add`/`drip source move` time
+/// instead (`handle_source` above), since a source belongs to exactly one
+/// topic -- there's no more "membership" to add/remove independently of that.
 fn handle_topic(action: &TopicAction, config: &Config) -> Result<()> {
     let conn = db::open(config)?;
     match action {
@@ -789,20 +805,31 @@ fn handle_topic(action: &TopicAction, config: &Config) -> Result<()> {
             topics::create_topic(&conn, name)?;
             println!("created topic '{name}'");
         }
-        TopicAction::AddSource { topic, source } => {
-            topics::add_source_to_topic(&conn, topic, source)?;
-            println!("added source '{source}' to topic '{topic}'");
-        }
-        TopicAction::RemoveSource { topic, source } => {
-            topics::remove_source_from_topic(&conn, topic, source)?;
-            println!("removed source '{source}' from topic '{topic}'");
-        }
         TopicAction::Remove { name } => {
-            if topics::remove_topic(&conn, name)? {
-                println!("removed topic '{name}'");
-            } else {
-                println!("no topic named '{name}'");
+            // Check existence + emptiness before ever touching
+            // `remove_topic` (bd issue drip-38w.2): a missing topic stays
+            // the pre-existing benign "no topic named" print (not an error),
+            // while a non-empty one is refused with an actionable message
+            // rather than surfacing the raw FK `RESTRICT` error `remove_topic`
+            // itself would otherwise hit.
+            let count = match topics::topic_source_count(&conn, name) {
+                Ok(count) => count,
+                Err(_) => {
+                    println!("no topic named '{name}'");
+                    return Ok(());
+                }
+            };
+
+            if count > 0 {
+                anyhow::bail!(
+                    "topic '{name}' still has {count} source(s); move them to another topic \
+                     first (e.g. `drip source move --name <label> --topic <other>`) before \
+                     removing it"
+                );
             }
+
+            topics::remove_topic(&conn, name)?;
+            println!("removed topic '{name}'");
         }
         TopicAction::List => {
             let saved = topics::list_topics(&conn)?;
@@ -830,7 +857,8 @@ fn handle_update(args: &UpdateArgs) -> Result<()> {
     let current = env!("CARGO_PKG_VERSION");
     println!("current version: v{current}");
 
-    let release = update::fetch_latest_release(update::GITHUB_API_BASE, update::REPO, args.verbose)?;
+    let release =
+        update::fetch_latest_release(update::GITHUB_API_BASE, update::REPO, args.verbose)?;
 
     if !update::is_newer(current, &release.tag_name) {
         println!("drip is up to date (v{current}).");
@@ -857,7 +885,8 @@ fn handle_update(args: &UpdateArgs) -> Result<()> {
 
     if !args.yes {
         match read_prompt(&format!("Install {}? (y/N)", release.tag_name), Some("n"))? {
-            Some(answer) if answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes") => {}
+            Some(answer)
+                if answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes") => {}
             _ => {
                 println!("update cancelled");
                 return Ok(());
@@ -892,6 +921,7 @@ fn handle_update(args: &UpdateArgs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cli::SourceAddArgs;
     use rusqlite::Connection;
 
     /// Build a `FetchArgs` with all the flag-resolution-relevant fields set
@@ -1071,8 +1101,13 @@ mod tests {
     fn handle_topic_add_creates_a_topic() {
         let (_dir, config) = fresh_config();
 
-        handle_topic(&TopicAction::Add { name: "rust".to_string() }, &config)
-            .expect("adding a new topic should succeed");
+        handle_topic(
+            &TopicAction::Add {
+                name: "rust".to_string(),
+            },
+            &config,
+        )
+        .expect("adding a new topic should succeed");
 
         let conn = db::open(&config).unwrap();
         let listed = topics::list_topics(&conn).unwrap();
@@ -1084,96 +1119,193 @@ mod tests {
     fn handle_topic_add_with_taken_name_errors_clearly() {
         let (_dir, config) = fresh_config();
 
-        handle_topic(&TopicAction::Add { name: "rust".to_string() }, &config).unwrap();
-        let err = handle_topic(&TopicAction::Add { name: "rust".to_string() }, &config)
-            .expect_err("duplicate topic name should error");
+        handle_topic(
+            &TopicAction::Add {
+                name: "rust".to_string(),
+            },
+            &config,
+        )
+        .unwrap();
+        let err = handle_topic(
+            &TopicAction::Add {
+                name: "rust".to_string(),
+            },
+            &config,
+        )
+        .expect_err("duplicate topic name should error");
 
         assert!(err.to_string().contains("already exists"));
     }
 
-    #[test]
-    fn handle_topic_add_source_and_remove_source_round_trip() {
-        let (_dir, config) = fresh_config();
-
-        handle_topic(&TopicAction::Add { name: "rust".to_string() }, &config).unwrap();
-        {
-            let conn = db::open(&config).unwrap();
-            sources::upsert_source(
-                &conn,
-                SourceKind::Rss,
-                "https://example.com/rust.xml",
-                Some("rust-blog"),
-            )
-            .unwrap();
+    /// Build a `SourceAddArgs` for `handle_source(&SourceAction::Add(...))`
+    /// end-to-end tests -- an RSS source labeled `name`, tied to `topic`, at
+    /// a throwaway `https://example.com/{name}.xml` URL. Sort/time/search
+    /// only matter for `--kind reddit`, so they're pinned to harmless
+    /// defaults here.
+    fn rss_source_add_args(name: &str, topic: &str) -> SourceAddArgs {
+        SourceAddArgs {
+            kind: SourceKind::Rss,
+            url: format!("https://example.com/{name}.xml"),
+            name: name.to_string(),
+            topic: topic.to_string(),
+            sort: Sort::Hot,
+            time: None,
+            search: None,
         }
-
-        handle_topic(
-            &TopicAction::AddSource {
-                topic: "rust".to_string(),
-                source: "rust-blog".to_string(),
-            },
-            &config,
-        )
-        .expect("adding a saved source to an existing topic should succeed");
-
-        let conn = db::open(&config).unwrap();
-        let listed = topics::list_topics(&conn).unwrap();
-        assert_eq!(listed[0].source_labels, vec!["rust-blog".to_string()]);
-        drop(conn);
-
-        handle_topic(
-            &TopicAction::RemoveSource {
-                topic: "rust".to_string(),
-                source: "rust-blog".to_string(),
-            },
-            &config,
-        )
-        .expect("removing a member source should succeed");
-
-        let conn = db::open(&config).unwrap();
-        let listed = topics::list_topics(&conn).unwrap();
-        assert!(listed[0].source_labels.is_empty());
     }
 
     #[test]
-    fn handle_topic_add_source_errors_clearly_when_topic_missing() {
+    fn handle_source_add_requires_existing_topic() {
         let (_dir, config) = fresh_config();
-        {
-            let conn = db::open(&config).unwrap();
-            sources::upsert_source(
-                &conn,
-                SourceKind::Rss,
-                "https://example.com/rust.xml",
-                Some("rust-blog"),
-            )
-            .unwrap();
-        }
 
-        let err = handle_topic(
-            &TopicAction::AddSource {
-                topic: "does-not-exist".to_string(),
-                source: "rust-blog".to_string(),
+        let err = handle_source(
+            &SourceAction::Add(rss_source_add_args("rust-blog", "nope")),
+            &config,
+        )
+        .expect_err("adding a source under a nonexistent topic should error");
+
+        let message = err.to_string();
+        assert!(
+            message.contains("nope"),
+            "error should mention the unknown topic name: {message}"
+        );
+        assert!(
+            message.contains("drip topic add"),
+            "error should point users at `drip topic add`: {message}"
+        );
+    }
+
+    #[test]
+    fn handle_source_add_ties_source_to_topic() {
+        let (_dir, config) = fresh_config();
+        handle_topic(
+            &TopicAction::Add {
+                name: "rust".to_string(),
             },
             &config,
         )
-        .expect_err("missing topic should error");
+        .unwrap();
+
+        handle_source(
+            &SourceAction::Add(rss_source_add_args("rust-blog", "rust")),
+            &config,
+        )
+        .expect("adding a source under an existing topic should succeed");
+
+        let conn = db::open(&config).unwrap();
+        let found = sources::find_by_label(&conn, "rust-blog")
+            .unwrap()
+            .expect("source should exist");
+        assert_eq!(found.topic_name, "rust");
+    }
+
+    #[test]
+    fn handle_source_move_round_trip() {
+        let (_dir, config) = fresh_config();
+        handle_topic(
+            &TopicAction::Add {
+                name: "rust".to_string(),
+            },
+            &config,
+        )
+        .unwrap();
+        handle_topic(
+            &TopicAction::Add {
+                name: "news".to_string(),
+            },
+            &config,
+        )
+        .unwrap();
+
+        handle_source(
+            &SourceAction::Add(rss_source_add_args("rust-blog", "rust")),
+            &config,
+        )
+        .expect("adding a source under 'rust' should succeed");
+
+        {
+            let conn = db::open(&config).unwrap();
+            let listed = topics::list_topics(&conn).unwrap();
+            let rust_topic = listed
+                .iter()
+                .find(|t| t.name == "rust")
+                .expect("'rust' topic should be in list_topics() output");
+            assert_eq!(rust_topic.source_labels, vec!["rust-blog".to_string()]);
+        }
+
+        handle_source(
+            &SourceAction::Move {
+                name: "rust-blog".to_string(),
+                topic: "news".to_string(),
+            },
+            &config,
+        )
+        .expect("moving a saved source to an existing topic should succeed");
+
+        let conn = db::open(&config).unwrap();
+        let listed = topics::list_topics(&conn).unwrap();
+        let rust_topic = listed
+            .iter()
+            .find(|t| t.name == "rust")
+            .expect("'rust' topic should be in list_topics() output");
+        assert!(
+            rust_topic.source_labels.is_empty(),
+            "source should have moved out of 'rust'"
+        );
+        let news_topic = listed
+            .iter()
+            .find(|t| t.name == "news")
+            .expect("'news' topic should be in list_topics() output");
+        assert_eq!(news_topic.source_labels, vec!["rust-blog".to_string()]);
+    }
+
+    #[test]
+    fn handle_source_move_errors_clearly_when_topic_missing() {
+        let (_dir, config) = fresh_config();
+        handle_topic(
+            &TopicAction::Add {
+                name: "rust".to_string(),
+            },
+            &config,
+        )
+        .unwrap();
+        handle_source(
+            &SourceAction::Add(rss_source_add_args("rust-blog", "rust")),
+            &config,
+        )
+        .unwrap();
+
+        let err = handle_source(
+            &SourceAction::Move {
+                name: "rust-blog".to_string(),
+                topic: "does-not-exist".to_string(),
+            },
+            &config,
+        )
+        .expect_err("moving to a nonexistent topic should error");
 
         assert!(err.to_string().contains("does-not-exist"));
     }
 
     #[test]
-    fn handle_topic_add_source_errors_clearly_when_source_missing() {
+    fn handle_source_move_errors_clearly_when_source_missing() {
         let (_dir, config) = fresh_config();
-        handle_topic(&TopicAction::Add { name: "rust".to_string() }, &config).unwrap();
-
-        let err = handle_topic(
-            &TopicAction::AddSource {
-                topic: "rust".to_string(),
-                source: "does-not-exist".to_string(),
+        handle_topic(
+            &TopicAction::Add {
+                name: "rust".to_string(),
             },
             &config,
         )
-        .expect_err("missing source should error");
+        .unwrap();
+
+        let err = handle_source(
+            &SourceAction::Move {
+                name: "does-not-exist".to_string(),
+                topic: "rust".to_string(),
+            },
+            &config,
+        )
+        .expect_err("moving an unknown source should error");
 
         assert!(err.to_string().contains("does-not-exist"));
     }
@@ -1181,13 +1313,67 @@ mod tests {
     #[test]
     fn handle_topic_remove_deletes_an_existing_topic() {
         let (_dir, config) = fresh_config();
-        handle_topic(&TopicAction::Add { name: "rust".to_string() }, &config).unwrap();
+        handle_topic(
+            &TopicAction::Add {
+                name: "rust".to_string(),
+            },
+            &config,
+        )
+        .unwrap();
 
-        handle_topic(&TopicAction::Remove { name: "rust".to_string() }, &config)
-            .expect("removing an existing topic should succeed");
+        handle_topic(
+            &TopicAction::Remove {
+                name: "rust".to_string(),
+            },
+            &config,
+        )
+        .expect("removing an existing (empty) topic should succeed");
 
         let conn = db::open(&config).unwrap();
         assert!(topics::list_topics(&conn).unwrap().is_empty());
+    }
+
+    #[test]
+    fn handle_topic_remove_refuses_when_topic_has_sources() {
+        let (_dir, config) = fresh_config();
+        handle_topic(
+            &TopicAction::Add {
+                name: "rust".to_string(),
+            },
+            &config,
+        )
+        .unwrap();
+        handle_source(
+            &SourceAction::Add(rss_source_add_args("rust-blog", "rust")),
+            &config,
+        )
+        .unwrap();
+
+        let err = handle_topic(
+            &TopicAction::Remove {
+                name: "rust".to_string(),
+            },
+            &config,
+        )
+        .expect_err("removing a non-empty topic should be refused");
+
+        let message = err.to_string();
+        assert!(
+            message.contains("source"),
+            "error should mention it still has sources: {message}"
+        );
+        assert!(
+            message.contains("move"),
+            "error should point at `drip source move`: {message}"
+        );
+
+        // Nothing should have been deleted.
+        let conn = db::open(&config).unwrap();
+        let listed = topics::list_topics(&conn).unwrap();
+        assert!(listed.iter().any(|t| t.name == "rust"));
+        assert!(sources::find_by_label(&conn, "rust-blog")
+            .unwrap()
+            .is_some());
     }
 
     #[test]
@@ -1237,7 +1423,11 @@ mod tests {
 
     /// Register a saved RSS source labeled `label`, backed by a mocked feed
     /// served by `server` at `/{label}.xml` returning [`rss_fixture`]`(label)`.
-    fn register_mocked_rss_source(conn: &Connection, server: &mut mockito::ServerGuard, label: &str) {
+    fn register_mocked_rss_source(
+        conn: &Connection,
+        server: &mut mockito::ServerGuard,
+        label: &str,
+    ) {
         let _mock = server
             .mock("GET", format!("/{label}.xml").as_str())
             .with_status(200)
@@ -1246,7 +1436,9 @@ mod tests {
             .create();
 
         let url = format!("{}/{label}.xml", server.url());
-        sources::upsert_source(conn, SourceKind::Rss, &url, Some(label))
+        let topic_id = topics::get_or_create_topic(conn, "Uncategorized")
+            .expect("get_or_create_topic should succeed");
+        sources::upsert_source(conn, SourceKind::Rss, &url, Some(label), topic_id)
             .expect("upsert_source should succeed");
     }
 
@@ -1296,7 +1488,7 @@ mod tests {
             }
             topics::create_topic(&conn, "typescript").unwrap();
             for label in ["a", "b", "c"] {
-                topics::add_source_to_topic(&conn, "typescript", label).unwrap();
+                topics::move_source_to_topic(&conn, "typescript", label).unwrap();
             }
         }
 
@@ -1327,7 +1519,7 @@ mod tests {
             }
             topics::create_topic(&conn, "typescript").unwrap();
             for label in ["a", "b", "c"] {
-                topics::add_source_to_topic(&conn, "typescript", label).unwrap();
+                topics::move_source_to_topic(&conn, "typescript", label).unwrap();
             }
         }
 
@@ -1381,16 +1573,13 @@ mod tests {
             if use_topic {
                 topics::create_topic(&conn, "typescript").unwrap();
                 for label in ["a", "b", "c"] {
-                    topics::add_source_to_topic(&conn, "typescript", label).unwrap();
+                    topics::move_source_to_topic(&conn, "typescript", label).unwrap();
                 }
             }
         }
 
-        handle_fetch(
-            &fetch_args_with_topics(&[], &["typescript"]),
-            &config_topic,
-        )
-        .expect("fetch with --topic should succeed");
+        handle_fetch(&fetch_args_with_topics(&[], &["typescript"]), &config_topic)
+            .expect("fetch with --topic should succeed");
         handle_fetch(&fetch_args(&["a", "b", "c"]), &config_source)
             .expect("fetch with --source should succeed");
 
@@ -1416,17 +1605,14 @@ mod tests {
             }
             topics::create_topic(&conn, "typescript").unwrap();
             for label in ["x", "b", "c"] {
-                topics::add_source_to_topic(&conn, "typescript", label).unwrap();
+                topics::move_source_to_topic(&conn, "typescript", label).unwrap();
             }
         }
 
         // "x" is named by both `--source` AND the `typescript` topic it
         // belongs to -- it must be fetched exactly once, not twice.
-        handle_fetch(
-            &fetch_args_with_topics(&["x"], &["typescript"]),
-            &config,
-        )
-        .expect("fetch with overlapping --source/--topic should succeed");
+        handle_fetch(&fetch_args_with_topics(&["x"], &["typescript"]), &config)
+            .expect("fetch with overlapping --source/--topic should succeed");
 
         let note = read_only_digest_note(vault_dir.path());
         let x_occurrences = note.matches("Post from x").count();
@@ -1486,12 +1672,14 @@ mod tests {
     #[test]
     fn resolve_topic_labels_returns_member_labels_for_a_known_topic() {
         let (_dir, conn) = fresh_conn();
+        let tid = topics::get_or_create_topic(&conn, "Uncategorized").unwrap();
 
         sources::upsert_source(
             &conn,
             SourceKind::Rss,
             "https://example.com/a.xml",
             Some("a"),
+            tid,
         )
         .unwrap();
         sources::upsert_source(
@@ -1499,14 +1687,14 @@ mod tests {
             SourceKind::Rss,
             "https://example.com/b.xml",
             Some("b"),
+            tid,
         )
         .unwrap();
         topics::create_topic(&conn, "typescript").unwrap();
-        topics::add_source_to_topic(&conn, "typescript", "a").unwrap();
-        topics::add_source_to_topic(&conn, "typescript", "b").unwrap();
+        topics::move_source_to_topic(&conn, "typescript", "a").unwrap();
+        topics::move_source_to_topic(&conn, "typescript", "b").unwrap();
 
-        let (labels, warnings) =
-            resolve_topic_labels(&conn, &["typescript".to_string()]);
+        let (labels, warnings) = resolve_topic_labels(&conn, &["typescript".to_string()]);
 
         assert_eq!(labels, vec!["a".to_string(), "b".to_string()]);
         assert!(warnings.is_empty());
@@ -1516,8 +1704,7 @@ mod tests {
     fn resolve_topic_labels_warns_clearly_on_an_unknown_topic_name() {
         let (_dir, conn) = fresh_conn();
 
-        let (labels, warnings) =
-            resolve_topic_labels(&conn, &["does-not-exist".to_string()]);
+        let (labels, warnings) = resolve_topic_labels(&conn, &["does-not-exist".to_string()]);
 
         assert!(labels.is_empty());
         assert_eq!(warnings.len(), 1);

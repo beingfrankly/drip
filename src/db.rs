@@ -30,6 +30,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (2, include_str!("../migrations/0002_profiles.sql")),
     (3, include_str!("../migrations/0003_source_labels.sql")),
     (4, include_str!("../migrations/0004_topics.sql")),
+    (5, include_str!("../migrations/0005_source_topic.sql")),
 ];
 
 /// Resolve the default location for `drip.db`: the same directory as
@@ -123,6 +124,7 @@ fn run_migrations(conn: &Connection) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::params;
 
     fn config_with_db_path(path: PathBuf) -> Config {
         Config {
@@ -143,7 +145,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version;", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 4);
+        assert_eq!(version, 5);
     }
 
     #[test]
@@ -164,7 +166,7 @@ mod tests {
         let version: i64 = conn2
             .query_row("PRAGMA user_version;", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 4);
+        assert_eq!(version, 5);
 
         let identifier: String = conn2
             .query_row(
@@ -227,7 +229,7 @@ mod tests {
     }
 
     #[test]
-    fn open_migrates_a_fresh_db_to_user_version_4() {
+    fn open_migrates_a_fresh_db_to_user_version_5() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("drip.db");
         let config = config_with_db_path(db_path);
@@ -237,7 +239,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version;", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 4);
+        assert_eq!(version, 5);
     }
 
     #[test]
@@ -312,6 +314,143 @@ mod tests {
         assert_eq!(
             topic_sources_count_after, 0,
             "topic_sources should be cascade-deleted with its source"
+        );
+    }
+
+    /// Exercise migration 0005's backfill directly, rather than through
+    /// [`open`] (which always jumps straight to the latest `user_version`
+    /// and so can never observe a database mid-way between 0004 and 0005).
+    /// Drives a raw connection through migrations 1-4 by hand, seeds legacy
+    /// `topic_sources` fixture data that predates the one-topic-per-source
+    /// model, then applies migration 0005 (`MIGRATIONS[4]`) and asserts its
+    /// three documented backfill behaviors (see
+    /// `migrations/0005_source_topic.sql`'s header comment): a
+    /// single-topic source keeps its topic, a multi-topic source collapses
+    /// to its lowest topic id, and a topicless source lands in a
+    /// newly-created "Uncategorized" topic -- and that `topic_sources`
+    /// itself is left untouched (still present, purely inert going
+    /// forward).
+    #[test]
+    fn migration_0005_backfills_topic_id_from_legacy_topic_sources() {
+        let conn = Connection::open_in_memory().expect("failed to open in-memory connection");
+        conn.execute_batch("PRAGMA foreign_keys = ON;")
+            .expect("failed to enable foreign keys");
+
+        // Apply migrations 1-4 by hand, in order, to reach the pre-0005
+        // schema state.
+        for (_version, sql) in &MIGRATIONS[0..4] {
+            conn.execute_batch(sql)
+                .expect("failed to apply a pre-0005 migration");
+        }
+
+        // Two legacy topics, explicit ids so the "collapses to the MIN
+        // topic id" assertion below is unambiguous.
+        conn.execute("INSERT INTO topics (id, name) VALUES (1, 'alpha')", [])
+            .unwrap();
+        conn.execute("INSERT INTO topics (id, name) VALUES (2, 'beta')", [])
+            .unwrap();
+
+        // (a) a source in exactly one topic.
+        conn.execute(
+            "INSERT INTO sources (id, kind, identifier) VALUES (1, 'rss', 'single-topic')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO topic_sources (topic_id, source_id) VALUES (1, 1)",
+            [],
+        )
+        .unwrap();
+
+        // (b) a source in TWO topics -- should collapse to the lowest
+        // topic id (1, not 2).
+        conn.execute(
+            "INSERT INTO sources (id, kind, identifier) VALUES (2, 'rss', 'multi-topic')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO topic_sources (topic_id, source_id) VALUES (2, 2)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO topic_sources (topic_id, source_id) VALUES (1, 2)",
+            [],
+        )
+        .unwrap();
+
+        // (c) a source in NO topic -- should land in a newly-created
+        // "Uncategorized" topic.
+        conn.execute(
+            "INSERT INTO sources (id, kind, identifier) VALUES (3, 'rss', 'no-topic')",
+            [],
+        )
+        .unwrap();
+
+        let topic_sources_count_before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM topic_sources", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(topic_sources_count_before, 3);
+
+        // Now apply migration 0005 itself.
+        let (version, sql) = &MIGRATIONS[4];
+        assert_eq!(*version, 5, "MIGRATIONS[4] should be the 0005 entry");
+        conn.execute_batch(sql)
+            .expect("failed to apply migration 0005");
+
+        let topic_id_of = |source_id: i64| -> Option<i64> {
+            conn.query_row(
+                "SELECT topic_id FROM sources WHERE id = ?1",
+                params![source_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+
+        assert_eq!(
+            topic_id_of(1),
+            Some(1),
+            "a source already in exactly one topic should keep that topic"
+        );
+        assert_eq!(
+            topic_id_of(2),
+            Some(1),
+            "a source in two topics should collapse to the MIN topic id"
+        );
+
+        let uncategorized_id: i64 = conn
+            .query_row(
+                "SELECT id FROM topics WHERE name = 'Uncategorized'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("an 'Uncategorized' topic should have been created");
+        assert_eq!(
+            topic_id_of(3),
+            Some(uncategorized_id),
+            "a source with no legacy topic membership should land in 'Uncategorized'"
+        );
+
+        let every_source_has_a_topic: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sources WHERE topic_id IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            every_source_has_a_topic, 0,
+            "no source should be left with a NULL topic_id after the backfill"
+        );
+
+        let topic_sources_count_after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM topic_sources", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            topic_sources_count_after, 3,
+            "topic_sources rows must survive the backfill untouched -- the table goes inert, \
+             not dropped or cleared"
         );
     }
 }

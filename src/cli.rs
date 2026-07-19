@@ -29,12 +29,20 @@ pub enum Commands {
         #[command(subcommand)]
         action: ConfigAction,
     },
-    /// Manage saved non-Reddit sources (RSS feeds, etc.)
+    /// Manage saved non-Reddit sources (RSS feeds, etc.). Every source
+    /// belongs to exactly one topic (see `Commands::Topic`'s doc comment) --
+    /// `drip source add` requires an existing `--topic`, and `drip source
+    /// move` reassigns an already-saved source to a different one.
     Source {
         #[command(subcommand)]
         action: SourceAction,
     },
-    /// Manage topics: named groups of saved sources
+    /// Manage topics: named groups of saved sources. A source belongs to
+    /// EXACTLY ONE topic at a time (tracked by `sources.topic_id`) -- there
+    /// is no many-to-many membership anymore. Assign a source to a topic at
+    /// `drip source add --topic` time, or reassign an existing one with
+    /// `drip source move --topic`; this subcommand only manages the topics
+    /// themselves (create/list/remove).
     Topic {
         #[command(subcommand)]
         action: TopicAction,
@@ -150,6 +158,15 @@ pub enum ConfigAction {
 pub enum SourceAction {
     /// Register a new non-Reddit source
     Add(SourceAddArgs),
+    /// Move a saved source to a different (existing) topic
+    Move {
+        /// Label of the source to move (see `drip source list`)
+        #[arg(long)]
+        name: String,
+        /// Destination topic name (must already exist)
+        #[arg(long)]
+        topic: String,
+    },
     /// Remove a saved source
     Remove {
         #[arg(long)]
@@ -166,21 +183,8 @@ pub enum TopicAction {
         #[arg(long)]
         name: String,
     },
-    /// Add a saved source to a topic
-    AddSource {
-        #[arg(long)]
-        topic: String,
-        #[arg(long)]
-        source: String,
-    },
-    /// Remove a saved source from a topic
-    RemoveSource {
-        #[arg(long)]
-        topic: String,
-        #[arg(long)]
-        source: String,
-    },
-    /// Remove a topic
+    /// Remove a topic. Refuses if the topic still owns any sources -- move
+    /// them elsewhere first with `drip source move`.
     Remove {
         #[arg(long)]
         name: String,
@@ -204,6 +208,11 @@ pub struct SourceAddArgs {
     pub url: String,
     #[arg(long)]
     pub name: String,
+
+    /// Topic this source belongs to. The topic must already exist -- create
+    /// it with `drip topic add`. Every source belongs to exactly one topic.
+    #[arg(long)]
+    pub topic: String,
 
     /// Sort order for this source (only meaningful with --kind reddit;
     /// ignored otherwise)

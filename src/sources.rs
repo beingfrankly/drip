@@ -18,12 +18,19 @@ use rusqlite::{params, Connection};
 use crate::types::SourceKind;
 
 /// A single `sources` row, as returned by the labeled-source lookups below.
+///
+/// `topic_id`/`topic_name` are always populated (bd issue drip-38w.1: every
+/// source belongs to EXACTLY ONE topic, tracked by `sources.topic_id`) --
+/// `find_by_label`/`list` join against `topics` to fetch them rather than
+/// leaving them optional.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SourceRow {
     pub id: i64,
     pub kind: SourceKind,
     pub identifier: String,
     pub display_name: Option<String>,
+    pub topic_id: i64,
+    pub topic_name: String,
 }
 
 /// Parse a `sources.kind` TEXT column value (already read out as a
@@ -57,6 +64,16 @@ fn parse_kind_column(raw: String) -> rusqlite::Result<SourceKind> {
 /// `upsert_reddit_source` below) must never clobber a label a `drip source
 /// add` call gave this row.
 ///
+/// `topic_id` is the row's owning topic (bd issue drip-38w.1: every source
+/// belongs to EXACTLY ONE topic). On a fresh insert it's always set. On the
+/// `Some(label)` conflict branch (re-adding an already-labeled source) it is
+/// ALSO updated, on the theory that re-running `drip source add` for an
+/// existing label is a deliberate re-assignment, not just a label refresh; on
+/// the `None`-label branch (`ON CONFLICT DO NOTHING`) it's only used for a
+/// genuinely fresh row, matching that branch's existing idempotency -- an
+/// unlabeled re-upsert (e.g. `upsert_reddit_source`) never touches an
+/// existing row's topic.
+///
 /// If `display_name` is `Some(x)` and `x` is already claimed by a DIFFERENT
 /// `(kind, identifier)` pair, the `idx_sources_display_name` unique index
 /// (`migrations/0003_source_labels.sql`) rejects the write; that raw SQLite
@@ -67,18 +84,21 @@ pub fn upsert_source(
     kind: SourceKind,
     identifier: &str,
     display_name: Option<&str>,
+    topic_id: i64,
 ) -> Result<i64> {
     let kind = kind.as_str();
     let result = match display_name {
         Some(label) => conn.execute(
-            "INSERT INTO sources (kind, identifier, display_name) VALUES (?1, ?2, ?3) \
-             ON CONFLICT(kind, identifier) DO UPDATE SET display_name = excluded.display_name",
-            params![kind, identifier, label],
+            "INSERT INTO sources (kind, identifier, display_name, topic_id) \
+             VALUES (?1, ?2, ?3, ?4) \
+             ON CONFLICT(kind, identifier) DO UPDATE SET \
+                display_name = excluded.display_name, topic_id = excluded.topic_id",
+            params![kind, identifier, label, topic_id],
         ),
         None => conn.execute(
-            "INSERT INTO sources (kind, identifier) VALUES (?1, ?2) \
+            "INSERT INTO sources (kind, identifier, topic_id) VALUES (?1, ?2, ?3) \
              ON CONFLICT(kind, identifier) DO NOTHING",
-            params![kind, identifier],
+            params![kind, identifier, topic_id],
         ),
     };
 
@@ -126,16 +146,24 @@ fn map_label_conflict(err: rusqlite::Error, display_name: Option<&str>) -> anyho
 /// `#[cfg(test)]` as a convenience fixture builder for
 /// `dedup.rs`/`fetch_runs.rs`/this module's own tests, which need a `sources`
 /// row to exist without caring about labeling.
+///
+/// Signature deliberately unchanged by bd issue drip-38w.1's one-topic-per-
+/// source model -- callers outside this module don't care which topic a
+/// fixture source lands in, so this gets-or-creates an "Uncategorized" topic
+/// internally rather than pushing a `topic_id` param onto every caller.
 #[cfg(test)]
 pub fn upsert_reddit_source(conn: &Connection, subreddit: &str) -> Result<i64> {
-    upsert_source(conn, SourceKind::Reddit, subreddit, None)
+    let topic_id = crate::topics::get_or_create_topic(conn, "Uncategorized")?;
+    upsert_source(conn, SourceKind::Reddit, subreddit, None, topic_id)
 }
 
 /// Look up a labeled source by its `display_name`. Returns `None` if no
 /// source has that label.
 pub fn find_by_label(conn: &Connection, label: &str) -> Result<Option<SourceRow>> {
     let row = conn.query_row(
-        "SELECT id, kind, identifier, display_name FROM sources WHERE display_name = ?1",
+        "SELECT s.id, s.kind, s.identifier, s.display_name, s.topic_id, t.name \
+         FROM sources s JOIN topics t ON t.id = s.topic_id \
+         WHERE s.display_name = ?1",
         params![label],
         |row| {
             Ok(SourceRow {
@@ -143,6 +171,8 @@ pub fn find_by_label(conn: &Connection, label: &str) -> Result<Option<SourceRow>
                 kind: parse_kind_column(row.get(1)?)?,
                 identifier: row.get(2)?,
                 display_name: row.get(3)?,
+                topic_id: row.get(4)?,
+                topic_name: row.get(5)?,
             })
         },
     );
@@ -162,8 +192,9 @@ pub fn find_by_label(conn: &Connection, label: &str) -> Result<Option<SourceRow>
 pub fn list(conn: &Connection) -> Result<Vec<SourceRow>> {
     let mut stmt = conn
         .prepare(
-            "SELECT id, kind, identifier, display_name FROM sources \
-             WHERE display_name IS NOT NULL ORDER BY display_name",
+            "SELECT s.id, s.kind, s.identifier, s.display_name, s.topic_id, t.name \
+             FROM sources s JOIN topics t ON t.id = s.topic_id \
+             WHERE s.display_name IS NOT NULL ORDER BY s.display_name",
         )
         .context("failed to prepare source list query")?;
 
@@ -173,6 +204,8 @@ pub fn list(conn: &Connection) -> Result<Vec<SourceRow>> {
             kind: parse_kind_column(row.get(1)?)?,
             identifier: row.get(2)?,
             display_name: row.get(3)?,
+            topic_id: row.get(4)?,
+            topic_name: row.get(5)?,
         })
     })?;
 
@@ -190,6 +223,32 @@ pub fn remove_by_label(conn: &Connection, label: &str) -> Result<bool> {
         )
         .with_context(|| format!("failed to remove source '{label}'"))?;
     Ok(changed > 0)
+}
+
+/// Assign/move the source labeled `source_label` to the topic `topic_id`
+/// (bd issue drip-38w.1). This is the single place `sources.topic_id` is
+/// ever updated after a source's initial insert -- both `drip topic
+/// add-source` (reassign) and `drip topic remove-source` (fall back to
+/// "Uncategorized") go through this, via `crate::topics`'s repointed
+/// wrappers.
+///
+/// Errors clearly if no source has `source_label` -- mirrors
+/// `crate::topics::source_by_label`'s "no source named ... (run `drip source
+/// list`)" message, since callers here are typically already holding a topic
+/// name and need the same clarity bar for an unknown source label.
+pub fn set_source_topic(conn: &Connection, source_label: &str, topic_id: i64) -> Result<()> {
+    let changed = conn
+        .execute(
+            "UPDATE sources SET topic_id = ?2 WHERE display_name = ?1",
+            params![source_label, topic_id],
+        )
+        .with_context(|| format!("failed to set topic for source '{source_label}'"))?;
+
+    if changed == 0 {
+        anyhow::bail!("no source named '{source_label}' (run `drip source list`)");
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -230,12 +289,14 @@ mod tests {
     #[test]
     fn upsert_source_with_a_label_is_findable_by_that_label() {
         let (_dir, conn) = fresh_conn();
+        let tid = crate::topics::get_or_create_topic(&conn, "Uncategorized").unwrap();
 
         upsert_source(
             &conn,
             SourceKind::Rss,
             "https://example.com/feed.xml",
             Some("rust-blog"),
+            tid,
         )
         .expect("upsert should succeed");
 
@@ -246,17 +307,21 @@ mod tests {
         assert_eq!(found.kind, SourceKind::Rss);
         assert_eq!(found.identifier, "https://example.com/feed.xml");
         assert_eq!(found.display_name, Some("rust-blog".to_string()));
+        assert_eq!(found.topic_id, tid);
+        assert_eq!(found.topic_name, "Uncategorized");
     }
 
     #[test]
     fn upsert_source_twice_with_same_identifier_and_new_label_renames_it() {
         let (_dir, conn) = fresh_conn();
+        let tid = crate::topics::get_or_create_topic(&conn, "Uncategorized").unwrap();
 
         let id1 = upsert_source(
             &conn,
             SourceKind::Rss,
             "https://example.com/feed.xml",
             Some("old-name"),
+            tid,
         )
         .expect("first upsert should succeed");
         let id2 = upsert_source(
@@ -264,6 +329,7 @@ mod tests {
             SourceKind::Rss,
             "https://example.com/feed.xml",
             Some("new-name"),
+            tid,
         )
         .expect("second upsert should succeed");
 
@@ -290,12 +356,14 @@ mod tests {
     #[test]
     fn upsert_source_with_a_label_claimed_by_a_different_identifier_errors_clearly() {
         let (_dir, conn) = fresh_conn();
+        let tid = crate::topics::get_or_create_topic(&conn, "Uncategorized").unwrap();
 
         upsert_source(
             &conn,
             SourceKind::Rss,
             "https://example.com/feed-a.xml",
             Some("taken"),
+            tid,
         )
         .expect("first upsert should succeed");
 
@@ -304,6 +372,7 @@ mod tests {
             SourceKind::Rss,
             "https://example.com/feed-b.xml",
             Some("taken"),
+            tid,
         )
         .expect_err("claiming an already-used label for a different source should error");
 
@@ -330,12 +399,14 @@ mod tests {
     #[test]
     fn list_returns_only_labeled_sources() {
         let (_dir, conn) = fresh_conn();
+        let tid = crate::topics::get_or_create_topic(&conn, "Uncategorized").unwrap();
 
         upsert_source(
             &conn,
             SourceKind::Rss,
             "https://example.com/feed.xml",
             Some("rust-blog"),
+            tid,
         )
         .expect("labeled upsert should succeed");
         upsert_reddit_source(&conn, "rust").expect("unlabeled upsert should succeed");
@@ -353,12 +424,14 @@ mod tests {
     #[test]
     fn remove_by_label_deletes_the_row_and_reports_success() {
         let (_dir, conn) = fresh_conn();
+        let tid = crate::topics::get_or_create_topic(&conn, "Uncategorized").unwrap();
 
         upsert_source(
             &conn,
             SourceKind::Rss,
             "https://example.com/feed.xml",
             Some("rust-blog"),
+            tid,
         )
         .expect("upsert should succeed");
 
@@ -371,12 +444,14 @@ mod tests {
     #[test]
     fn remove_by_label_returns_false_for_unknown_label_without_side_effects() {
         let (_dir, conn) = fresh_conn();
+        let tid = crate::topics::get_or_create_topic(&conn, "Uncategorized").unwrap();
 
         upsert_source(
             &conn,
             SourceKind::Rss,
             "https://example.com/feed.xml",
             Some("rust-blog"),
+            tid,
         )
         .expect("upsert should succeed");
 
@@ -390,5 +465,42 @@ mod tests {
             count, 1,
             "removing an unknown label must not touch existing rows"
         );
+    }
+
+    #[test]
+    fn set_source_topic_moves_the_source_to_the_given_topic() {
+        let (_dir, conn) = fresh_conn();
+        let tid_a = crate::topics::get_or_create_topic(&conn, "a").unwrap();
+        let tid_b = crate::topics::get_or_create_topic(&conn, "b").unwrap();
+
+        upsert_source(
+            &conn,
+            SourceKind::Rss,
+            "https://example.com/feed.xml",
+            Some("rust-blog"),
+            tid_a,
+        )
+        .expect("upsert should succeed");
+
+        set_source_topic(&conn, "rust-blog", tid_b).expect("set_source_topic should succeed");
+
+        let found = find_by_label(&conn, "rust-blog")
+            .unwrap()
+            .expect("source should still exist");
+        assert_eq!(found.topic_id, tid_b);
+        assert_eq!(found.topic_name, "b");
+    }
+
+    #[test]
+    fn set_source_topic_errors_clearly_for_an_unknown_label() {
+        let (_dir, conn) = fresh_conn();
+        let tid = crate::topics::get_or_create_topic(&conn, "Uncategorized").unwrap();
+
+        let err = set_source_topic(&conn, "does-not-exist", tid)
+            .expect_err("unknown source label should error");
+
+        let message = err.to_string();
+        assert!(message.contains("does-not-exist"));
+        assert!(message.contains("drip source list"));
     }
 }

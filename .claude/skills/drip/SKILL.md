@@ -13,9 +13,17 @@ description: Use when the user wants to fetch Reddit/RSS/YouTube content into an
 
 Interactive first-run wizard. Sets `vault_path` in `config.toml` and seeds SQLite `settings` (posts folder, daily notes folder, daily note date format, default sort, default limit). Can optionally install a daily cron entry for unattended fetches; re-running and confirming again updates that entry in place rather than duplicating it.
 
-### `drip source add --kind rss|youtube|reddit --url <url> --name <label>`
+### `drip source add --kind rss|youtube|reddit --url <url> --name <label> --topic <name>`
 
-Registers a source under a fetchable label. `--url`'s meaning depends on `--kind`:
+Registers a source under a fetchable label. **Every source belongs to exactly one topic** — `--topic` is required, and the named topic must **already exist** (`drip source add` does NOT auto-create it). If it doesn't, this errors:
+
+```
+no topic named '<name>'; create it first with `drip topic add --name <name>`
+```
+
+So the order is always: `drip topic add --name <name>` first, then `drip source add ... --topic <name>`.
+
+`--url`'s meaning depends on `--kind`:
 
 - `--kind rss`: a genuine RSS/Atom feed URL (e.g. `https://blog.rust-lang.org/feed.xml`).
 - `--kind youtube`: a channel id (starts with `UC`) or a `https://www.youtube.com/channel/UC.../` URL. Handle-style URLs (`/@name`) are **not** supported — resolving those to a channel id needs an extra request; find the canonical channel id/URL instead (channel's About page, or page source for `"channelId":"UC...`).
@@ -29,22 +37,32 @@ Reddit-only flags on `source add` (ignored for other kinds):
 
 These are baked into the feed URL at `source add` time, not at fetch time.
 
+### `drip source move --name <label> --topic <name>`
+
+Reassigns an already-saved source to a different (existing) topic. This is the **only** way to change a source's topic after it's been registered — since a source always belongs to exactly one topic, there's no separate "add to topic"/"remove from topic" operation; you move it instead. The destination topic must already exist (same "create it first with `drip topic add`" error as `source add` if it doesn't). Moving a source to the topic it's already in is a harmless no-op.
+
 ### `drip source list`
 
-Lists saved sources.
+Lists saved sources, each showing its topic:
+
+```
+- rust-hot (topic: rust, kind: reddit, url: rust)
+```
 
 ### `drip source remove --name <label>`
 
 Removes a saved source by label.
 
-### `drip topic add|add-source|remove-source|remove|list`
+### `drip topic add|list|remove`
 
-Topics are named groups of saved sources, so a recurring set of labels can be fetched as one unit instead of typing every member label on every `drip fetch --source ...`.
+Topics are named groups of saved sources, so a recurring set of labels can be fetched as one unit instead of typing every member label on every `drip fetch --source ...`. **A source belongs to exactly one topic at a time** — assign it at `drip source add --topic` time, or reassign it with `drip source move --topic`. There is no many-to-many membership; `drip topic` itself only manages topics (create/list/remove), not source membership.
 
 - `drip topic add --name <name>` — create a new (empty) topic. Errors clearly if the name is already taken.
-- `drip topic add-source --topic <name> --source <label>` — attach an already-saved source (by its `drip source add`/`drip source list` label) to a topic. Adding the same source to the same topic twice is a no-op, not an error. Errors clearly if either the topic or the source doesn't exist.
-- `drip topic remove-source --topic <name> --source <label>` — detach a source from a topic. Not being a member is a no-op, not an error.
-- `drip topic remove --name <name>` — delete a topic. Does **not** delete its member sources — only the topic and its membership rows.
+- `drip topic remove --name <name>` — delete a topic. **Refuses if the topic still owns any sources**, with:
+  ```
+  topic '<name>' still has N source(s); move them to another topic first (e.g. `drip source move --name <label> --topic <other>`) before removing it
+  ```
+  Removing an empty topic still works. Removing an unknown topic name is still benign (prints `no topic named '<name>'`, not an error).
 - `drip topic list` — list every saved topic with its member sources' labels.
 
 ### `drip fetch --source <label>[,<label>...] --topic <name>[,<name>...] --all [flags]`
@@ -75,6 +93,16 @@ Flags:
 
 Checks GitHub Releases for a newer tag than the running binary's version. `--check` reports only, without installing. `-y` skips the install confirmation prompt. Downloads and installs over the currently running binary, wherever it lives. **Linux x86_64 only** today (the only platform currently released).
 
+## Digest format
+
+Every fetch writes one markdown note into `Resources/drip` (the `posts_folder` setting), grouped topic → source → item:
+
+- **Frontmatter:** `tags:` (only the user/`default_tags` tags, e.g. `drip` — `tags: []` if empty), `createdOn`, `modifiedOn`, `topics: [...]` (distinct topics referenced, first-seen order), `sources: [...]` (source labels fetched), `sort`, `time_filter`, `query`, `fetched_count`.
+- **Body:** an H1 `# drip digest — <local timestamp>`, then a `**Sources:** ... · **Sort:** ... · **Query:** ...` summary line, then for each topic an H2 `## <topic>`, under it each source an H3 (`### r/<sub>` for reddit, `### <label>` for rss/youtube), under it each item as an Obsidian checkbox task: `- [ ] **[<title>](<url>)** — u/<author>` (reddit) or `— <author>` (rss/youtube), with a leading `⚠️ NSFW ` marker on NSFW items.
+- No score, comment count, flair, or summary excerpt is rendered — and no LLM summaries, by design.
+
+The checkbox items are the point: they're plain Obsidian tasks, surfaced elsewhere via an Obsidian Base and the Taskforge iOS app, so the user can tick each one off as they clip it (processed) or decide it's not interesting ("simple done") — independent of this skill or `drip` itself.
+
 ## Gotchas
 
 - **`fetch --sort`/`--time`/`-q`/`--query` are cosmetic only.** They label the digest note's frontmatter/header and never filter or search what gets fetched. Real Reddit sort/time-window/search must be set at `drip source add --kind reddit --sort/--time/--search` registration time instead.
@@ -84,27 +112,29 @@ Checks GitHub Releases for a newer tag than the running binary's version. `--che
 - **No credentials of any kind are ever needed.** Every source kind (Reddit, RSS, YouTube) is fetched via a plain unauthenticated HTTP GET against a public feed URL — no API key, app registration, or OAuth flow anywhere in this tool.
 - **`--tag` on `fetch` adds real Obsidian tags** to the digest note (not just a label), unlike `--sort`/`--time`/`--query`.
 - **The digest filename only uses the topic's name when exactly one `--topic` is given and it resolves cleanly.** With zero topics it falls back to the joined source labels; with a `--topic` name that failed to resolve (e.g. a typo) it also falls back to the joined source labels; with more than one `--topic` it joins the topic names themselves (not their member source labels).
-- **Removing a topic (`drip topic remove`) never deletes its member sources** — only the topic and its `topic_sources` membership rows. The sources themselves stay saved and fetchable by `--source`.
+- **Every source belongs to exactly one topic — there's no multi-assign.** `drip source add` requires `--topic`, and reassigning is `drip source move --name <label> --topic <name>`, not an "add to another topic" operation. `drip topic remove` refuses while it still owns any sources (move them out first); an empty topic can always be removed, and doing so never deletes the sources that were in it.
 
 ## Example workflow
 
 ```bash
-# Register a Reddit source with a real sort/time/search baked in
-drip source add --kind reddit --url rust --sort top --time week --search "async" --name rust-async-weekly
+# Create the topic first -- `drip source add` requires it to already exist
+drip topic add --name rust
+
+# Register a Reddit source with a real sort/time/search baked in, into that topic
+drip source add --kind reddit --url rust --sort top --time week --search "async" --name rust-async-weekly --topic rust
 
 # Fetch it on its own
 drip fetch --source rust-async-weekly --tag rust --dry-run
 
-# Register an RSS source
-drip source add --kind rss --url https://blog.rust-lang.org/feed.xml --name rust-blog
+# Register an RSS source into the same topic
+drip source add --kind rss --url https://blog.rust-lang.org/feed.xml --name rust-blog --topic rust
 
 # Fetch both together in one combined digest
 drip fetch --source rust-async-weekly,rust-blog -n 5 --tag rust
 
-# Group them into a topic instead of typing both labels every time
-drip topic add --name rust
-drip topic add-source --topic rust --source rust-async-weekly
-drip topic add-source --topic rust --source rust-blog
+# Reassign a source to a different (existing) topic
+drip topic add --name programming
+drip source move --name rust-blog --topic programming
 
 # Fetch the whole topic in one go -- digest filename/header is labeled "rust"
 drip fetch --topic rust --tag rust

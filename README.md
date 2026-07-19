@@ -1,6 +1,6 @@
 # drip
 
-`drip` is a Rust CLI that fetches hot/trending Reddit posts and RSS/Atom feed entries from sources you choose, writes them as a "digest" markdown note into your Obsidian vault, and links that note from your daily journal note.
+`drip` is a Rust CLI that fetches hot/trending Reddit posts and RSS/Atom feed entries from sources you choose, groups them by topic, writes them as a "digest" markdown note into your Obsidian vault, and links that note from your daily journal note.
 
 ## Prerequisites
 
@@ -61,20 +61,22 @@ This walks you through your Obsidian vault path and a few defaults (posts folder
 
 ## Usage
 
+Every source belongs to exactly one topic, so a topic named `rust` is assumed to already exist (`drip topic add --name rust`) before any of the `drip source add` examples below — see "Topics: grouping sources" for the full picture.
+
 ### Reddit subreddits
 
 Register a subreddit as a source, then fetch it by label. This uses Reddit's own public RSS/Atom feed for the subreddit — no API key, app registration, or credentials of any kind needed:
 
 ```bash
-drip source add --kind reddit --url rust --name rust-hot
+drip source add --kind reddit --url rust --name rust-hot --topic rust
 drip fetch --source rust-hot
 ```
 
 Pick a sort, time window, or restrict to posts matching a search term — these are baked into the feed URL at `source add` time, not at fetch time:
 
 ```bash
-drip source add --kind reddit --url ObsidianMD --search tasks --name obsidian-tasks
-drip source add --kind reddit --url rust --sort top --time week --name rust-weekly-top
+drip source add --kind reddit --url ObsidianMD --search tasks --name obsidian-tasks --topic rust
+drip source add --kind reddit --url rust --sort top --time week --name rust-weekly-top --topic rust
 ```
 
 `--search` is a free-text Reddit search within the subreddit, not a flair filter — flair isn't available through this feed. Since this goes through Reddit's public feed rather than a JSON API, these sources have no post score, comment count, or flair to filter on.
@@ -86,7 +88,7 @@ drip source add --kind reddit --url rust --sort top --time week --name rust-week
 Register an RSS or Atom feed under a label, then fetch it by that label — on its own, or alongside other sources in one combined digest:
 
 ```bash
-drip source add --kind rss --url https://blog.rust-lang.org/feed.xml --name rust-blog
+drip source add --kind rss --url https://blog.rust-lang.org/feed.xml --name rust-blog --topic rust
 drip fetch --source rust-blog
 drip fetch --source rust-hot,rust-blog --dry-run
 ```
@@ -94,29 +96,20 @@ drip fetch --source rust-hot,rust-blog --dry-run
 YouTube channels work the same way — `drip` fetches a channel's own Atom feed, so no YouTube API key is needed. Pass either the channel id (starts with `UC`) or its `https://www.youtube.com/channel/UC.../` URL — handle URLs like `/@name` aren't supported, since resolving those to a channel id needs an extra request; find the canonical channel id/URL instead (e.g. via the channel's About page, or by viewing page source for `"channelId":"UC...`):
 
 ```bash
-drip source add --kind youtube --url UC_x5XG1OV2P6uZZ5FSM9Ttw --name gfd
+drip source add --kind youtube --url UC_x5XG1OV2P6uZZ5FSM9Ttw --name gfd --topic rust
 drip fetch --source gfd
 ```
 
 `--source` accepts a comma-separated list (repeat the flag or comma-separate) to combine any mix of registered sources — Reddit, RSS, YouTube — into one digest.
 
-### Managing sources
-
-List or remove saved sources:
-
-```bash
-drip source list
-drip source remove --name rust-blog
-```
-
 ### Topics: grouping sources
 
-A topic is a named group of already-saved sources — fetch the whole group with one `--topic` name instead of typing every member's `--source` label each time:
+**Every source belongs to exactly one topic.** `drip source add` requires an existing `--topic` and does not auto-create one — create the topic first (as in "Usage" above), then register sources into it, then fetch the whole group with one `--topic` name instead of typing every member's `--source` label each time:
 
 ```bash
 drip topic add --name rust
-drip topic add-source --topic rust --source rust-hot
-drip topic add-source --topic rust --source rust-blog
+drip source add --kind reddit --url rust --name rust-hot --topic rust
+drip source add --kind rss --url https://blog.rust-lang.org/feed.xml --name rust-blog --topic rust
 
 drip fetch --topic rust
 ```
@@ -129,10 +122,32 @@ drip fetch --source rust-weekly-top --topic rust
 
 When exactly one `--topic` is given and it resolves cleanly, the digest note's filename and header are labeled with the topic's name (e.g. `rust`) instead of joining every member source's label. With zero `--topic`s, or one that fails to resolve (e.g. a typo), it falls back to the existing joined-source-labels behavior; with more than one `--topic`, it labels the note with the topic names joined instead.
 
+There's no separate "attach"/"detach" operation — since a source always has exactly one topic, reassigning it to a different (existing) topic is `drip source move`:
+
 ```bash
-drip topic remove-source --topic rust --source rust-blog  # detach one source
-drip topic remove --name rust                              # delete the topic (its sources are unaffected)
-drip topic list                                             # see saved topics and their members
+drip topic add --name programming
+drip source move --name rust-blog --topic programming   # reassign it to another (existing) topic
+drip topic list                                           # see saved topics and their members
+```
+
+`drip topic remove --name <name>` deletes a topic, but **refuses while it still owns any sources**, telling you to move them first:
+
+```
+topic 'rust' still has 1 source(s); move them to another topic first (e.g. `drip source move --name <label> --topic <other>`) before removing it
+```
+
+An empty topic can always be removed; removing a topic never deletes the sources that were in it (move them elsewhere first, then the topic they're left in can be removed).
+
+### Managing sources
+
+List or remove saved sources — `drip source list` now shows each source's topic:
+
+```bash
+drip source list
+# - rust-hot (topic: rust, kind: reddit, url: rust)
+# - rust-blog (topic: rust, kind: rss, url: https://blog.rust-lang.org/feed.xml)
+
+drip source remove --name rust-blog
 ```
 
 ### Fetching every saved source
@@ -171,6 +186,21 @@ View or edit the config file directly:
 drip config show
 drip config edit
 ```
+
+## Digest format
+
+Each fetch writes one markdown note into your vault's posts folder (`Resources/drip` by default, the `posts_folder` setting), grouped **topic → source → item**:
+
+- **Frontmatter:** `tags:` (only your `--tag`/`default_tags` tags, e.g. `drip` — renders as `tags: []` when empty), `createdOn`, `modifiedOn`, `topics: [...]` (every distinct topic referenced by this run, in first-seen order), `sources: [...]` (the source labels fetched), `sort`, `time_filter`, `query`, `fetched_count`.
+- **Body:** an `# drip digest — <local timestamp>` heading, then a `**Sources:** ... · **Sort:** ... · **Query:** ...` summary line, then for each topic an `## <topic>` heading; under it, each source gets its own `### r/<subreddit>` (Reddit) or `### <label>` (RSS/YouTube) heading; under that, each item is a single Obsidian checkbox task:
+
+  ```markdown
+  - [ ] **[Async traits stabilized](https://example.com/post)** — u/someone
+  ```
+
+  (`— <author>` without the `u/` prefix for RSS/YouTube items; a leading `⚠️ NSFW ` marker on NSFW Reddit posts.) There's no score, comment count, flair, or summary excerpt — and no LLM-generated summary — by design.
+
+The checkbox format is deliberate: these are plain Obsidian tasks, which this setup surfaces elsewhere (an Obsidian Base, and the Taskforge iOS app) so you can tick an item off once you've clipped it into somewhere permanent, or just mark it "simple done" if it turned out not to be interesting — independently of `drip` itself, which only ever writes the note once and never touches it again.
 
 ## Running unattended (cron / systemd timer)
 

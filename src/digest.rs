@@ -19,19 +19,18 @@ use crate::types::{Sort, SourceKind, TimeFilter};
 /// they show up in a computed filename, get replaced with `-`.
 const UNSAFE_FILENAME_CHARS: [char; 9] = [':', '/', '\\', '*', '?', '"', '<', '>', '|'];
 
-/// Roughly how many characters of an item's summary to show in the digest
-/// excerpt before truncating.
-const EXCERPT_CHAR_LIMIT: usize = 200;
-
 /// Identifies one group of items in a [`DigestRun`]: which source kind it
-/// came from ([`SourceKind::Reddit`]/`Rss`/`Youtube`) and the group's
-/// display name (a subreddit name, for Reddit). Rendering picks
-/// source-kind-specific formatting (e.g. `## r/{name}` for Reddit) based on
-/// `kind`.
+/// came from ([`SourceKind::Reddit`]/`Rss`/`Youtube`), the group's display
+/// name (a subreddit name, for Reddit), and the topic it belongs to (bd issue
+/// drip-38w.1: every source belongs to exactly one topic). Rendering picks
+/// source-kind-specific formatting (e.g. `### r/{name}` for Reddit) based on
+/// `kind`, and groups sources under a `## {topic}` heading based on `topic`
+/// (bd issue drip-38w.3).
 #[derive(Debug, Clone, PartialEq)]
 pub struct SourceGroup {
     pub kind: SourceKind,
     pub name: String,
+    pub topic: String,
 }
 
 /// Everything needed to render (and name) a single digest note: which
@@ -48,7 +47,9 @@ pub struct DigestRun {
     /// Reddit-origin groups.
     pub tags: Vec<String>,
     /// Fetched items, grouped by source, in the order they should appear in
-    /// the note.
+    /// the note. Rendering further groups these by [`SourceGroup::topic`]
+    /// (bd issue drip-38w.3), but the per-source order within a topic, and
+    /// the items within a source, are taken from this field's order as-is.
     pub items_by_source: Vec<(SourceGroup, Vec<Item>)>,
     /// The topic name used for this run (via `--topic`), if any. Used as
     /// the digest's filename label instead of joining source names, when
@@ -88,20 +89,30 @@ impl DigestRun {
             .sum()
     }
 
-    /// `reddit` + `reddit/{name}` for each distinct Reddit-origin group in
-    /// `items_by_source`, plus any user-supplied tags, deduplicated while
-    /// preserving first-seen order.
-    fn all_tags(&self) -> Vec<String> {
-        let mut tags = vec!["reddit".to_string()];
-        for (group, _) in &self.items_by_source {
-            if group.kind.is_reddit() {
-                tags.push(format!("reddit/{}", group.name));
-            }
-        }
-        tags.extend(self.tags.iter().cloned());
-
+    /// Distinct topics referenced by `items_by_source`'s groups, in
+    /// first-seen order. Drives the `topics:` frontmatter key and the
+    /// `## {topic}` body headings (bd issue drip-38w.3) -- drip is no longer
+    /// Reddit-only, so topics (not subreddits) are the note's top-level
+    /// grouping.
+    pub fn topics(&self) -> Vec<String> {
         let mut seen = std::collections::HashSet::new();
-        tags.into_iter()
+        self.items_by_source
+            .iter()
+            .map(|(group, _)| group.topic.clone())
+            .filter(|t| seen.insert(t.clone()))
+            .collect()
+    }
+
+    /// The user-supplied tags (e.g. from `--tag`, plus `settings`'s
+    /// `default_tags`), deduplicated while preserving first-seen order.
+    /// Drip is no longer Reddit-only (bd issue drip-38w.3), so this no
+    /// longer adds the `reddit`/`reddit/{name}` tags it used to -- a note
+    /// pulling in RSS/YouTube sources shouldn't be tagged `reddit` at all.
+    fn all_tags(&self) -> Vec<String> {
+        let mut seen = std::collections::HashSet::new();
+        self.tags
+            .iter()
+            .cloned()
             .filter(|t| seen.insert(t.clone()))
             .collect()
     }
@@ -143,7 +154,7 @@ fn sanitize_filename(name: &str) -> String {
 /// would expect.
 pub fn digest_filename(run: &DigestRun) -> String {
     let local_ts = run.created_at.with_timezone(&Local).format("%Y-%m-%d %H%M");
-    let raw = format!("{local_ts} - Reddit digest ({}).md", run.label());
+    let raw = format!("{local_ts} - drip digest ({}).md", run.label());
     sanitize_filename(&raw)
 }
 
@@ -153,62 +164,17 @@ fn escape_title(title: &str) -> String {
     title.replace('[', "\\[").replace(']', "\\]")
 }
 
-/// Collapse a summary into a single-line excerpt: newlines become spaces,
-/// and the result is truncated to roughly [`EXCERPT_CHAR_LIMIT`] characters
-/// (on a `char` boundary, so this never panics on multi-byte UTF-8), with a
-/// trailing `…` if truncation happened.
-fn excerpt(summary: &str) -> String {
-    let collapsed = summary.replace('\n', " ");
-    let total_chars = collapsed.chars().count();
-    if total_chars <= EXCERPT_CHAR_LIMIT {
-        return collapsed;
-    }
-    let mut truncated: String = collapsed.chars().take(EXCERPT_CHAR_LIMIT).collect();
-    truncated.push('…');
-    truncated
-}
-
-/// Render one numbered item entry (without the trailing blank line). Every
-/// field beyond `id`/`title`/`url` is rendered conditionally on whether
-/// it's present, since only Reddit-origin items populate all of them today.
+/// Render one item as a single Obsidian checkbox-task line (no trailing
+/// blank line, no numbering): `- [ ] {nsfw}{heading}{author_suffix}`.
 /// `source_kind` picks the author formatting: Reddit's `u/{name}` convention
 /// only makes sense for Reddit usernames, not RSS/YouTube author names
-/// (drip-01b).
-fn render_item(index: usize, item: &Item, source_kind: SourceKind) -> String {
+/// (drip-01b). Score/comment-count/flair/summary are no longer rendered
+/// (bd issue drip-38w.3 replaced the old numbered-list-with-metadata format
+/// with a flat checklist) -- the NSFW marker is the one piece of metadata
+/// kept, since it's a content warning rather than decoration.
+fn render_item(item: &Item, source_kind: SourceKind) -> String {
     let nsfw = if item.nsfw { "⚠️ NSFW " } else { "" };
     let title = escape_title(&item.title);
-
-    let mut meta_parts: Vec<String> = Vec::new();
-    if let Some(score) = item.score {
-        meta_parts.push(format!("{score} pts"));
-    }
-    if let Some(num_comments) = item.num_comments {
-        meta_parts.push(format!("{num_comments} comments"));
-    }
-    if let Some(author) = &item.author {
-        if source_kind.is_reddit() {
-            // Reddit's own Atom/RSS feed's `<author><name>` field already
-            // has the `/u/` prefix baked in (e.g. "/u/llogiq"), so strip any
-            // pre-existing `/u/`/`u/` prefix before re-adding the canonical
-            // one, to avoid a doubled `u//u/llogiq`. This is defensive --
-            // kept in case any future `--kind reddit` source ever supplies a
-            // bare username instead.
-            let clean = author.trim_start_matches("/u/").trim_start_matches("u/");
-            meta_parts.push(format!("u/{clean}"));
-        } else {
-            meta_parts.push(author.clone());
-        }
-    }
-    if let Some(flair) = &item.flair {
-        meta_parts.push(flair.clone());
-    }
-    let mut meta = meta_parts.join(" · ");
-
-    if let Some(comments_url) = &item.comments_url {
-        if comments_url != &item.url {
-            meta.push_str(&format!(" · [external link]({})", item.url));
-        }
-    }
 
     let heading_link = item.comments_url.as_deref().unwrap_or(&item.url);
     // A sparse/malformed feed entry (via `feed-rs`) can have an empty title
@@ -226,15 +192,23 @@ fn render_item(index: usize, item: &Item, source_kind: SourceKind) -> String {
     } else {
         format!("**[{title_display}]({heading_link})**")
     };
-    let mut lines = vec![format!("{index}. {nsfw}{heading} — {meta}")];
 
-    if let Some(summary) = &item.summary {
-        if !summary.is_empty() {
-            lines.push(format!("   > {}", excerpt(summary)));
+    let author_suffix = match &item.author {
+        Some(author) if source_kind.is_reddit() => {
+            // Reddit's own Atom/RSS feed's `<author><name>` field already
+            // has the `/u/` prefix baked in (e.g. "/u/llogiq"), so strip any
+            // pre-existing `/u/`/`u/` prefix before re-adding the canonical
+            // one, to avoid a doubled `u//u/llogiq`. This is defensive --
+            // kept in case any future `--kind reddit` source ever supplies a
+            // bare username instead.
+            let clean = author.trim_start_matches("/u/").trim_start_matches("u/");
+            format!(" — u/{clean}")
         }
-    }
+        Some(author) => format!(" — {author}"),
+        None => String::new(),
+    };
 
-    lines.join("\n")
+    format!("- [ ] {nsfw}{heading}{author_suffix}")
 }
 
 /// Pure rendering: given a `DigestRun`, produce the full markdown note text
@@ -242,13 +216,24 @@ fn render_item(index: usize, item: &Item, source_kind: SourceKind) -> String {
 pub fn render_digest_note(run: &DigestRun) -> String {
     let created_iso = run.created_at.format("%Y-%m-%dT%H:%M:%SZ");
     let tags = run.all_tags();
-    let tags_block = tags
-        .iter()
-        .map(|t| format!("  - {t}"))
-        .collect::<Vec<_>>()
-        .join("\n");
+    // Empty tag set -> inline `tags: []` rather than a bare `tags:` key with
+    // a blank line under it, which is malformed-looking YAML. Non-empty ->
+    // the usual block-sequence form. In practice `default_tags` seeds at
+    // least `drip`, so the empty case only arises if a user clears their tag
+    // settings and passes no `--tag`.
+    let tags_yaml = if tags.is_empty() {
+        "tags: []\n".to_string()
+    } else {
+        let block = tags
+            .iter()
+            .map(|t| format!("  - {t}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!("tags:\n{block}\n")
+    };
 
-    let subreddits_list = run.source_labels().join(", ");
+    let topics_list = run.topics().join(", ");
+    let sources_list = run.source_labels().join(", ");
     let time_filter_yaml = match run.time {
         Some(t) => t.as_str().to_string(),
         None => "null".to_string(),
@@ -260,12 +245,11 @@ pub fn render_digest_note(run: &DigestRun) -> String {
 
     let mut out = String::new();
     out.push_str("---\n");
-    out.push_str("tags:\n");
-    out.push_str(&tags_block);
-    out.push('\n');
+    out.push_str(&tags_yaml);
     out.push_str(&format!("createdOn: \"{created_iso}\"\n"));
     out.push_str(&format!("modifiedOn: \"{created_iso}\"\n"));
-    out.push_str(&format!("subreddits: [{subreddits_list}]\n"));
+    out.push_str(&format!("topics: [{topics_list}]\n"));
+    out.push_str(&format!("sources: [{sources_list}]\n"));
     out.push_str(&format!("sort: {}\n", run.sort.as_str()));
     out.push_str(&format!("time_filter: {time_filter_yaml}\n"));
     out.push_str(&format!("query: {query_yaml}\n"));
@@ -276,7 +260,7 @@ pub fn render_digest_note(run: &DigestRun) -> String {
         .created_at
         .with_timezone(&Local)
         .format("%Y-%m-%d %H:%M");
-    out.push_str(&format!("# Reddit digest — {local_ts}\n\n"));
+    out.push_str(&format!("# drip digest — {local_ts}\n\n"));
 
     let source_labels_display = run
         .items_by_source
@@ -290,16 +274,29 @@ pub fn render_digest_note(run: &DigestRun) -> String {
     };
     let query_label = run.query.as_deref().unwrap_or("—");
     out.push_str(&format!(
-        "**Subreddits:** {source_labels_display} · **Sort:** {sort_label} · **Query:** {query_label}\n\n"
+        "**Sources:** {source_labels_display} · **Sort:** {sort_label} · **Query:** {query_label}\n\n"
     ));
 
-    for (group, items) in &run.items_by_source {
-        let heading = format!("## {}", group.kind.heading_prefix(&group.name));
-        out.push_str(&heading);
-        out.push_str("\n\n");
-        for (i, item) in items.iter().enumerate() {
-            out.push_str(&render_item(i + 1, item, group.kind));
-            out.push_str("\n\n");
+    // Body grouping (bd issue drip-38w.3): distinct topics, in first-seen
+    // order, each an H2; under each topic, its source groups (in their
+    // existing `items_by_source` order) each an H3; under each source, its
+    // items in feed order as flat checkbox lines. `topics()` already
+    // computes the first-seen topic order -- for each topic, filter
+    // `items_by_source` down to the groups belonging to it, which preserves
+    // their relative order since the filter is a stable pass over the
+    // original `Vec`.
+    for topic in run.topics() {
+        out.push_str(&format!("## {topic}\n\n"));
+        for (group, items) in &run.items_by_source {
+            if group.topic != topic {
+                continue;
+            }
+            out.push_str(&format!("### {}\n\n", group.kind.heading_prefix(&group.name)));
+            for item in items {
+                out.push_str(&render_item(item, group.kind));
+                out.push('\n');
+            }
+            out.push('\n');
         }
     }
 
@@ -358,14 +355,30 @@ mod tests {
         }
     }
 
+    /// Build a `DigestRun` from `(name, items)` pairs, each a Reddit-origin
+    /// group under a shared `"Programming"` topic -- the common case most
+    /// tests below need. Use [`sample_run_with_topics`] instead when a test
+    /// needs distinct topics or non-Reddit kinds.
     fn sample_run(items_by_subreddit: Vec<(String, Vec<Item>)>) -> DigestRun {
-        let items_by_source = items_by_subreddit
+        sample_run_with_topics(
+            items_by_subreddit
+                .into_iter()
+                .map(|(name, items)| ("Programming".to_string(), name, items))
+                .collect(),
+        )
+    }
+
+    /// Build a `DigestRun` from `(topic, name, items)` triples, each a
+    /// Reddit-origin group -- for tests that need multiple distinct topics.
+    fn sample_run_with_topics(items: Vec<(String, String, Vec<Item>)>) -> DigestRun {
+        let items_by_source = items
             .into_iter()
-            .map(|(name, items)| {
+            .map(|(topic, name, items)| {
                 (
                     SourceGroup {
                         kind: SourceKind::Reddit,
                         name,
+                        topic,
                     },
                     items,
                 )
@@ -384,21 +397,16 @@ mod tests {
 
     #[test]
     fn demo_full_featured_rendering_sample() {
-        let mut self_post = sample_item("abc123", "A [neat] discovery about lifetimes");
-        self_post.summary = Some("I found something interesting today.\nHere's the gist of it, repeated a bit to push past two hundred characters so we can see the truncation ellipsis kick in for real: lorem ipsum dolor sit amet.".to_string());
-        self_post.flair = Some("Discussion".to_string());
+        let self_post = sample_item("abc123", "A [neat] discovery about lifetimes");
 
         let mut link_post = sample_item("def456", "Another title");
         link_post.comments_url =
             Some("https://reddit.com/r/rust/comments/def456/post/".to_string());
         link_post.url = "https://example.com/thing".to_string();
-        link_post.score = Some(12);
-        link_post.num_comments = Some(3);
         link_post.author = Some("someone".to_string());
 
         let mut nsfw_post = sample_item("ghi789", "A spicy post");
         nsfw_post.nsfw = true;
-        nsfw_post.score = Some(5);
 
         let run = sample_run(vec![(
             "rust".to_string(),
@@ -407,11 +415,10 @@ mod tests {
         let note = render_digest_note(&run);
 
         assert!(note.contains("A \\[neat\\] discovery about lifetimes"));
-        assert!(note.contains("· Discussion"));
-        assert!(note.contains("[external link](https://example.com/thing)"));
         assert!(note.contains("⚠️ NSFW **[A spicy post]"));
         // Exactly one blank line between the query summary line and the
-        // first subreddit heading, and between post entries.
+        // first topic heading, between the topic and source headings, and
+        // between sections generally.
         assert!(!note.contains("\n\n\n"));
     }
 
@@ -433,43 +440,21 @@ mod tests {
         assert!(note.starts_with("---\n"));
         assert!(note.contains("createdOn: \"2026-07-08T14:32:10Z\""));
         assert!(note.contains("modifiedOn: \"2026-07-08T14:32:10Z\""));
-        assert!(note.contains("subreddits: [rust, programming]"));
+        assert!(note.contains("topics: [Programming]"));
+        assert!(note.contains("sources: [rust, programming]"));
         assert!(note.contains("sort: top"));
         assert!(note.contains("time_filter: day"));
         assert!(note.contains("fetched_count: 2"));
-        assert!(note.contains("## r/rust"));
-        assert!(note.contains("## r/programming"));
+        assert!(note.contains("## Programming"));
+        assert!(note.contains("### r/rust"));
+        assert!(note.contains("### r/programming"));
         assert!(
             note.contains("**[Some post title](https://reddit.com/r/rust/comments/abc123/post/)**")
         );
-        assert!(note.contains("42 pts · 5 comments · u/someone"));
-        assert!(note.contains("**Subreddits:** r/rust, r/programming"));
+        assert!(note.contains("u/someone"));
+        assert!(note.contains("**Sources:** r/rust, r/programming"));
         assert!(note.contains("**Sort:** top (day)"));
         assert!(note.contains("**Query:** —"));
-    }
-
-    #[test]
-    fn truncates_long_selftext_excerpt_without_raw_newlines() {
-        let mut item = sample_item("abc123", "Long post");
-        let long_text = "a".repeat(50) + "\nline two\n" + &"b".repeat(200);
-        item.summary = Some(long_text);
-
-        let run = sample_run(vec![("rust".to_string(), vec![item])]);
-        let note = render_digest_note(&run);
-
-        assert!(
-            note.contains('…'),
-            "expected an ellipsis marking truncation:\n{note}"
-        );
-        // The excerpt line itself must not contain a raw newline (only the
-        // note's own line breaks, which are between markdown elements, not
-        // inside the excerpt text).
-        let excerpt_line = note
-            .lines()
-            .find(|l| l.trim_start().starts_with('>'))
-            .expect("expected a blockquote excerpt line");
-        assert!(!excerpt_line.contains('\n'));
-        assert!(excerpt_line.starts_with("   > "));
     }
 
     #[test]
@@ -489,7 +474,41 @@ mod tests {
         let run = sample_run(vec![("rust".to_string(), vec![item])]);
         let note = render_digest_note(&run);
 
-        assert!(note.contains("1. ⚠️ NSFW **[NSFW post]"));
+        assert!(note.contains("- [ ] ⚠️ NSFW **[NSFW post]"));
+    }
+
+    #[test]
+    fn checkbox_lines_start_with_exactly_dash_space_bracket_space_bracket_space() {
+        let item = sample_item("abc123", "A post");
+        let run = sample_run(vec![("rust".to_string(), vec![item])]);
+        let note = render_digest_note(&run);
+
+        let item_line = note
+            .lines()
+            .find(|l| l.contains("A post"))
+            .expect("expected a line containing the post title");
+        assert!(
+            item_line.starts_with("- [ ] "),
+            "checkbox line must start with exactly '- [ ] ':\n{item_line}"
+        );
+    }
+
+    #[test]
+    fn item_with_no_author_renders_with_no_trailing_dash_suffix() {
+        let mut item = sample_item("abc123", "Authorless post");
+        item.author = None;
+        let run = sample_run(vec![("rust".to_string(), vec![item])]);
+        let note = render_digest_note(&run);
+
+        let item_line = note
+            .lines()
+            .find(|l| l.contains("Authorless post"))
+            .expect("expected a line containing the post title");
+        assert_eq!(
+            item_line,
+            "- [ ] **[Authorless post](https://reddit.com/r/rust/comments/abc123/post/)**",
+            "no author must not leave a trailing ' — ' suffix"
+        );
     }
 
     #[test]
@@ -508,6 +527,7 @@ mod tests {
                     SourceGroup {
                         kind: SourceKind::Reddit,
                         name: "rust".to_string(),
+                        topic: "Programming".to_string(),
                     },
                     vec![reddit_item],
                 ),
@@ -515,6 +535,7 @@ mod tests {
                     SourceGroup {
                         kind: SourceKind::Rss,
                         name: "rust-blog".to_string(),
+                        topic: "Programming".to_string(),
                     },
                     vec![rss_item],
                 ),
@@ -551,6 +572,7 @@ mod tests {
                 SourceGroup {
                     kind: SourceKind::Reddit,
                     name: "rust".to_string(),
+                    topic: "Programming".to_string(),
                 },
                 vec![item],
             )],
@@ -590,22 +612,51 @@ mod tests {
     }
 
     #[test]
-    fn tags_are_deduped_and_include_per_subreddit_tags() {
+    fn tags_are_deduped_to_just_the_user_supplied_tags() {
+        // bd issue drip-38w.3: drip is no longer Reddit-only, so tags are no
+        // longer auto-populated with `reddit`/`reddit/{name}` -- only the
+        // deduped user/default tags (e.g. `--tag`/`default_tags`) appear.
         let mut run = sample_run(vec![
             ("rust".to_string(), vec![sample_item("a", "t")]),
             ("rust".to_string(), vec![sample_item("b", "t2")]),
         ]);
-        run.tags = vec!["dev".to_string(), "reddit".to_string()];
+        run.tags = vec!["dev".to_string(), "drip".to_string(), "dev".to_string()];
 
         let tags = run.all_tags();
-        assert_eq!(
-            tags,
-            vec![
-                "reddit".to_string(),
-                "reddit/rust".to_string(),
-                "dev".to_string()
-            ]
+        assert_eq!(tags, vec!["dev".to_string(), "drip".to_string()]);
+    }
+
+    #[test]
+    fn rendered_note_tags_block_contains_only_user_tags() {
+        let mut run = sample_run(vec![("rust".to_string(), vec![sample_item("a", "t")])]);
+        run.tags = vec!["drip".to_string()];
+
+        let note = render_digest_note(&run);
+
+        assert!(note.contains("tags:\n  - drip\n"));
+        // Check specifically the tags block (the note's title/URLs may
+        // legitimately contain "reddit" elsewhere, e.g. reddit.com links).
+        let tags_block = note
+            .split("createdOn:")
+            .next()
+            .expect("expected a tags block before createdOn");
+        assert!(
+            !tags_block.contains("reddit"),
+            "must not auto-tag the note `reddit`:\n{tags_block}"
         );
+    }
+
+    #[test]
+    fn rendered_note_with_no_tags_uses_inline_empty_array() {
+        // An empty tag set must render as `tags: []`, not a bare `tags:` key
+        // with a blank line beneath it (malformed-looking frontmatter).
+        let mut run = sample_run(vec![("rust".to_string(), vec![sample_item("a", "t")])]);
+        run.tags = vec![];
+
+        let note = render_digest_note(&run);
+
+        assert!(note.contains("tags: []\n"), "expected inline empty tags array:\n{note}");
+        assert!(!note.contains("tags:\n\n"), "must not emit a bare tags key with a blank line:\n{note}");
     }
 
     #[test]
@@ -616,6 +667,7 @@ mod tests {
         let filename = digest_filename(&run);
         assert!(!filename.contains(':'));
         assert!(filename.contains("weekly- digest"));
+        assert!(filename.contains("drip digest"));
         assert!(filename.ends_with(".md"));
     }
 
@@ -678,5 +730,87 @@ mod tests {
 
         assert!(path.exists());
         assert!(dir.path().join(nested_folder).is_dir());
+    }
+
+    #[test]
+    fn two_sources_under_the_same_topic_render_under_one_topic_heading() {
+        let run = sample_run_with_topics(vec![
+            (
+                "Programming".to_string(),
+                "rust".to_string(),
+                vec![sample_item("a", "Rust post")],
+            ),
+            (
+                "Programming".to_string(),
+                "golang".to_string(),
+                vec![sample_item("b", "Go post")],
+            ),
+        ]);
+
+        let note = render_digest_note(&run);
+
+        assert_eq!(
+            note.matches("## Programming").count(),
+            1,
+            "two sources under the same topic must share ONE topic heading:\n{note}"
+        );
+        assert!(note.contains("### r/rust"));
+        assert!(note.contains("### r/golang"));
+    }
+
+    #[test]
+    fn sources_under_different_topics_render_under_separate_headings_in_first_seen_order() {
+        let run = sample_run_with_topics(vec![
+            (
+                "Claude".to_string(),
+                "ClaudeCode".to_string(),
+                vec![sample_item("a", "Claude post")],
+            ),
+            (
+                "Rust".to_string(),
+                "rust-hot".to_string(),
+                vec![sample_item("b", "Rust post")],
+            ),
+        ]);
+
+        let note = render_digest_note(&run);
+
+        let h2_count = note.lines().filter(|l| l.starts_with("## ")).count();
+        assert_eq!(h2_count, 2, "expected exactly two H2 topic headings:\n{note}");
+        let claude_idx = note.find("## Claude").expect("expected a Claude heading");
+        let rust_idx = note.find("## Rust").expect("expected a Rust heading");
+        assert!(
+            claude_idx < rust_idx,
+            "topics should appear in first-seen order:\n{note}"
+        );
+        assert!(note.contains("topics: [Claude, Rust]"));
+    }
+
+    #[test]
+    fn renders_a_two_topic_three_source_sample() {
+        // The exact scenario described in bd issue drip-38w.3's target
+        // format: two topics, three sources, one item each.
+        let run = sample_run_with_topics(vec![
+            (
+                "Claude".to_string(),
+                "ClaudeCode".to_string(),
+                vec![sample_item("a", "Anthropic ships MCP update")],
+            ),
+            (
+                "Rust".to_string(),
+                "rust-hot".to_string(),
+                vec![sample_item("b", "Async traits stabilized")],
+            ),
+        ]);
+
+        let note = render_digest_note(&run);
+
+        assert!(note.contains("topics: [Claude, Rust]"));
+        assert!(note.contains("sources: [ClaudeCode, rust-hot]"));
+        assert!(note.contains("## Claude"));
+        assert!(note.contains("### r/ClaudeCode"));
+        assert!(note.contains("## Rust"));
+        assert!(note.contains("### r/rust-hot"));
+        assert!(!note.contains("\n\n\n"));
     }
 }
