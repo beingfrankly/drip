@@ -515,30 +515,12 @@ fn handle_fetch(args: &FetchArgs, config: &Config) -> Result<()> {
         return Ok(());
     }
 
-    // Label the digest's filename with the `--topic` name when exactly one
-    // topic was given and it resolved successfully (bd issue drip-p6v.8) --
-    // `topic_warnings` being empty is what "resolved successfully" means
-    // here, since `resolve_topic_labels` only ever pushes a warning for an
-    // unknown topic name or a data-integrity issue with one of its members.
-    // Zero topics falls back to `None` (the existing joined-source-labels
-    // behavior, unchanged). More than one topic isn't covered by the bd
-    // issue's acceptance criteria; join the topic names the same way
-    // multiple sources already join in `source_labels()`, rather than
-    // picking one arbitrarily or over-engineering a dedicated format.
-    let topic_label = match args.topic.as_slice() {
-        [] => None,
-        [single] if topic_warnings.is_empty() => Some(single.clone()),
-        [_single_with_warnings] => None,
-        multiple => Some(multiple.join(", ")),
-    };
-
     let run = DigestRun {
         sort: resolved.sort,
         time: resolved.time,
         query: resolved.query.clone(),
         tags: resolved.tag.clone(),
         items_by_source: groups,
-        topic: topic_label,
         created_at: chrono::Utc::now(),
     };
 
@@ -1722,10 +1704,11 @@ mod tests {
     }
 
     #[test]
-    fn fetch_with_single_topic_labels_digest_filename_with_topic_name() {
-        // bd issue drip-p6v.8: a single `--topic` resolves to a filename
-        // label of the topic name itself, not the joined member-source
-        // labels ("a, b, c").
+    fn fetch_with_topic_produces_iso_date_daily_digest_filename() {
+        // The digest filename is now just the local ISO date plus a "Daily
+        // digest" suffix -- no topic/source-label parenthetical (`--topic`
+        // still resolves which sources get fetched; it just no longer
+        // affects the filename).
         let (_db_dir, vault_dir, config) = fresh_config_with_vault();
         let mut server = mockito::Server::new();
 
@@ -1761,14 +1744,14 @@ mod tests {
             .expect("filename should be valid UTF-8")
             .to_string();
 
-        assert!(
-            filename.contains("(typescript)"),
-            "expected the digest filename to be labeled with the topic name, not the joined \
-             member-source labels:\n{filename}"
+        let expected = format!(
+            "{} - Daily digest.md",
+            chrono::Local::now().format("%Y-%m-%d")
         );
-        assert!(
-            !filename.contains("a, b, c"),
-            "digest filename should not fall back to the joined member-source labels:\n{filename}"
+        assert_eq!(
+            filename, expected,
+            "expected the digest filename to be the plain ISO-date + 'Daily digest' name, \
+             with no topic/source-label parenthetical:\n{filename}"
         );
     }
 

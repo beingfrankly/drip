@@ -51,10 +51,6 @@ pub struct DigestRun {
     /// (bd issue drip-38w.3), but the per-source order within a topic, and
     /// the items within a source, are taken from this field's order as-is.
     pub items_by_source: Vec<(SourceGroup, Vec<Item>)>,
-    /// The topic name used for this run (via `--topic`), if any. Used as
-    /// the digest's filename label instead of joining source names, when
-    /// available.
-    pub topic: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -71,9 +67,9 @@ impl DigestRun {
 
     /// The [`SourceGroup`] of each group in `items_by_source`, in fetch
     /// order, cloned. Unlike [`source_labels`](Self::source_labels) (bare
-    /// names, used for `digest_filename`'s label), this keeps each group's
-    /// `kind` -- needed so `journal::digest_bullet` can render `r/{name}`
-    /// only for Reddit-origin groups (see bd issue drip-15n.9.6).
+    /// names, used for the `sources:` frontmatter key), this keeps each
+    /// group's `kind` -- needed so `journal::digest_bullet` can render
+    /// `r/{name}` only for Reddit-origin groups (see bd issue drip-15n.9.6).
     pub fn source_groups(&self) -> Vec<SourceGroup> {
         self.items_by_source
             .iter()
@@ -116,20 +112,6 @@ impl DigestRun {
             .filter(|t| seen.insert(t.clone()))
             .collect()
     }
-
-    /// The filename label: the topic name if one was used for this run,
-    /// otherwise a comma-joined, trimmed list of source names.
-    fn label(&self) -> String {
-        match &self.topic {
-            Some(name) if !name.trim().is_empty() => name.trim().to_string(),
-            _ => self
-                .source_labels()
-                .iter()
-                .map(|s| s.trim().to_string())
-                .collect::<Vec<_>>()
-                .join(", "),
-        }
-    }
 }
 
 /// Replace any character in [`UNSAFE_FILENAME_CHARS`], anywhere in `name`,
@@ -149,13 +131,11 @@ fn sanitize_filename(name: &str) -> String {
 }
 
 /// Compute the sanitized filename (including `.md` extension, excluding
-/// any directory) for this digest run. Uses the local timezone for the
-/// human-facing timestamp, matching what a person reading their vault
-/// would expect.
+/// any directory) for this digest run: the local-timezone ISO date plus a
+/// "Daily digest" suffix -- no time-of-day, no topic/source parenthetical.
 pub fn digest_filename(run: &DigestRun) -> String {
-    let local_ts = run.created_at.with_timezone(&Local).format("%Y-%m-%d %H%M");
-    let raw = format!("{local_ts} - drip digest ({}).md", run.label());
-    sanitize_filename(&raw)
+    let date = run.created_at.with_timezone(&Local).format("%Y-%m-%d");
+    sanitize_filename(&format!("{date} - Daily digest.md"))
 }
 
 /// Escape `[` and `]` in an item's title so it can't break `[title](url)`
@@ -256,11 +236,8 @@ pub fn render_digest_note(run: &DigestRun) -> String {
     out.push_str(&format!("fetched_count: {}\n", run.fetched_count()));
     out.push_str("---\n\n");
 
-    let local_ts = run
-        .created_at
-        .with_timezone(&Local)
-        .format("%Y-%m-%d %H:%M");
-    out.push_str(&format!("# drip digest — {local_ts}\n\n"));
+    let local_date = run.created_at.with_timezone(&Local).format("%Y-%m-%d");
+    out.push_str(&format!("# {local_date} - Daily digest\n\n"));
 
     let source_labels_display = run
         .items_by_source
@@ -390,7 +367,6 @@ mod tests {
             query: None,
             tags: vec![],
             items_by_source,
-            topic: None,
             created_at: Utc.with_ymd_and_hms(2026, 7, 8, 14, 32, 10).unwrap(),
         }
     }
@@ -445,6 +421,7 @@ mod tests {
         assert!(note.contains("sort: top"));
         assert!(note.contains("time_filter: day"));
         assert!(note.contains("fetched_count: 2"));
+        assert!(note.contains("# 2026-07-08 - Daily digest\n"));
         assert!(note.contains("## Programming"));
         assert!(note.contains("### r/rust"));
         assert!(note.contains("### r/programming"));
@@ -455,6 +432,25 @@ mod tests {
         assert!(note.contains("**Sources:** r/rust, r/programming"));
         assert!(note.contains("**Sort:** top (day)"));
         assert!(note.contains("**Query:** —"));
+    }
+
+    #[test]
+    fn h1_heading_is_iso_date_plus_daily_digest_with_no_time_of_day() {
+        let run = sample_run(vec![("rust".to_string(), vec![sample_item("a", "t")])]);
+        let note = render_digest_note(&run);
+
+        assert!(
+            note.contains("# 2026-07-08 - Daily digest\n"),
+            "expected the new date-only H1 heading:\n{note}"
+        );
+        let h1_line = note
+            .lines()
+            .find(|l| l.starts_with("# "))
+            .expect("expected an H1 heading line");
+        assert!(
+            !h1_line.contains("1432") && !h1_line.contains("14:32"),
+            "H1 heading must not include a time-of-day:\n{h1_line}"
+        );
     }
 
     #[test]
@@ -540,7 +536,6 @@ mod tests {
                     vec![rss_item],
                 ),
             ],
-            topic: None,
             created_at: Utc.with_ymd_and_hms(2026, 7, 8, 14, 32, 10).unwrap(),
         };
         let note = render_digest_note(&run);
@@ -576,7 +571,6 @@ mod tests {
                 },
                 vec![item],
             )],
-            topic: None,
             created_at: Utc.with_ymd_and_hms(2026, 7, 8, 14, 32, 10).unwrap(),
         };
         let note = render_digest_note(&run);
@@ -660,26 +654,33 @@ mod tests {
     }
 
     #[test]
-    fn filename_is_sanitized_and_uses_topic_label_when_present() {
-        let mut run = sample_run(vec![("rust".to_string(), vec![sample_item("a", "t")])]);
-        run.topic = Some("weekly: digest".to_string());
+    fn filename_is_iso_date_plus_daily_digest() {
+        let run = sample_run(vec![("rust".to_string(), vec![sample_item("a", "t")])]);
 
         let filename = digest_filename(&run);
-        assert!(!filename.contains(':'));
-        assert!(filename.contains("weekly- digest"));
-        assert!(filename.contains("drip digest"));
+        assert_eq!(filename, "2026-07-08 - Daily digest.md");
+        assert!(!filename.contains('('));
+        assert!(!filename.contains(')'));
+        assert!(!filename.contains("1432"), "filename must not include a time-of-day:\n{filename}");
         assert!(filename.ends_with(".md"));
     }
 
     #[test]
-    fn filename_joins_subreddits_when_no_topic() {
-        let run = sample_run(vec![
+    fn filename_is_identical_regardless_of_sources_or_topics() {
+        // The filename is now purely a function of the run's date -- unlike
+        // the old topic/source-label parenthetical, differing sources or
+        // topics must not change it.
+        let single_source_run = sample_run(vec![("rust".to_string(), vec![sample_item("a", "t")])]);
+        let multi_source_run = sample_run(vec![
             ("rust".to_string(), vec![sample_item("a", "t")]),
             ("programming".to_string(), vec![sample_item("b", "t2")]),
         ]);
 
-        let filename = digest_filename(&run);
-        assert!(filename.contains("rust, programming"));
+        assert_eq!(
+            digest_filename(&single_source_run),
+            digest_filename(&multi_source_run)
+        );
+        assert_eq!(digest_filename(&single_source_run), "2026-07-08 - Daily digest.md");
     }
 
     #[test]

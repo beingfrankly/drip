@@ -201,10 +201,10 @@ drip config edit
 
 ## Digest format
 
-Each fetch writes one markdown note into your vault's posts folder (`Resources/drip` by default, the `posts_folder` setting), grouped **topic → source → item**:
+Each fetch writes one markdown note into your vault's posts folder (`Resources/drip` by default, the `posts_folder` setting), named `<YYYY-MM-DD> - Daily digest.md` (local ISO date only — no time, no topic/source label), grouped **topic → source → item**. Because the name carries no time, it's one note per calendar day: a second fetch the same day overwrites it (and, since dedup only carries not-yet-seen items, would replace it with fewer) — a non-issue for the once-daily cron.
 
 - **Frontmatter:** `tags:` (only your `--tag`/`default_tags` tags, e.g. `drip` — renders as `tags: []` when empty), `createdOn`, `modifiedOn`, `topics: [...]` (every distinct topic referenced by this run, in first-seen order), `sources: [...]` (the source labels fetched), `sort`, `time_filter`, `query`, `fetched_count`.
-- **Body:** an `# drip digest — <local timestamp>` heading, then a `**Sources:** ... · **Sort:** ... · **Query:** ...` summary line, then for each topic an `## <topic>` heading; under it, each source gets its own `### r/<subreddit>` (Reddit) or `### <label>` (RSS/YouTube) heading; under that, each item is a single Obsidian checkbox task:
+- **Body:** an `# <YYYY-MM-DD> - Daily digest` heading, then a `**Sources:** ... · **Sort:** ... · **Query:** ...` summary line, then for each topic an `## <topic>` heading; under it, each source gets its own `### r/<subreddit>` (Reddit) or `### <label>` (RSS/YouTube) heading; under that, each item is a single Obsidian checkbox task:
 
   ```markdown
   - [ ] **[Async traits stabilized](https://example.com/post)** — u/someone
