@@ -9,6 +9,7 @@ mod item;
 mod journal;
 mod reddit_feed;
 mod rss;
+mod rules;
 mod settings;
 mod sources;
 mod topics;
