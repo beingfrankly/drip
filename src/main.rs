@@ -25,7 +25,7 @@ use rusqlite::Connection;
 
 use cli::{Cli, Commands, ConfigAction, FetchArgs, SourceAction, TopicAction, UpdateArgs};
 use config::Config;
-use digest::{digest_filename, render_digest_note, write_digest_note, DigestRun, SourceGroup};
+use digest::{digest_filename, preview_digest_note, write_digest_note, DigestRun, SourceGroup};
 use item::Item;
 use types::{Sort, SourceKind, TimeFilter};
 
@@ -524,9 +524,12 @@ fn handle_fetch(args: &FetchArgs, config: &Config) -> Result<()> {
         created_at: chrono::Utc::now(),
     };
 
+    let posts_folder = args.folder.as_deref().unwrap_or(&settings.posts_folder);
+
     if args.dry_run {
         println!("--- dry run: digest note preview ---");
-        println!("{}", render_digest_note(&run));
+        let preview = preview_digest_note(&config.vault_path, posts_folder, &run)?;
+        println!("{preview}");
 
         if args.no_journal {
             vprintln(
@@ -563,7 +566,6 @@ fn handle_fetch(args: &FetchArgs, config: &Config) -> Result<()> {
         return Ok(());
     }
 
-    let posts_folder = args.folder.as_deref().unwrap_or(&settings.posts_folder);
     let path = write_digest_note(&config.vault_path, posts_folder, &run)?;
     println!("drip fetch: wrote digest note to {}", path.display());
 
@@ -1919,5 +1921,50 @@ mod tests {
              existing unknown --source warning: {}",
             warnings[0]
         );
+    }
+
+    #[test]
+    fn fetch_twice_same_day_merges_new_items_without_clobbering_earlier_ones() {
+        let (_db_dir, vault_dir, config) = fresh_config_with_vault();
+        let mut server = mockito::Server::new();
+
+        {
+            let conn = db::open(&config).unwrap();
+            register_mocked_rss_source(&conn, &mut server, "a");
+        }
+        handle_fetch(&fetch_args(&["a"]), &config).expect("first fetch should succeed");
+
+        {
+            let conn = db::open(&config).unwrap();
+            register_mocked_rss_source(&conn, &mut server, "b");
+        }
+        handle_fetch(&fetch_args(&["a", "b"]), &config).expect("second fetch should succeed");
+
+        // Still exactly one digest note for the day, now holding BOTH sources'
+        // items: 'a' (from run 1, not clobbered) and 'b' (merged in on run 2).
+        let note = read_only_digest_note(vault_dir.path());
+        assert!(note.contains("Post from a"), "run-1 item must survive the second run:\n{note}");
+        assert!(note.contains("Post from b"), "run-2 item must be merged in:\n{note}");
+    }
+
+    #[test]
+    fn fetch_twice_same_day_with_no_new_items_leaves_the_note_untouched() {
+        let (_db_dir, vault_dir, config) = fresh_config_with_vault();
+        let mut server = mockito::Server::new();
+
+        {
+            let conn = db::open(&config).unwrap();
+            register_mocked_rss_source(&conn, &mut server, "a");
+        }
+        handle_fetch(&fetch_args(&["a"]), &config).expect("first fetch should succeed");
+        let after_first = read_only_digest_note(vault_dir.path());
+
+        // Nothing new the second time (same feed, already recorded seen) ->
+        // the note must be left byte-for-byte unchanged.
+        handle_fetch(&fetch_args(&["a"]), &config).expect("second fetch should succeed");
+        let after_second = read_only_digest_note(vault_dir.path());
+
+        assert_eq!(after_first, after_second, "a no-new-items re-run must not change the note");
+        assert!(after_first.contains("Post from a"));
     }
 }

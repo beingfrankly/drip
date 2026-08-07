@@ -303,12 +303,265 @@ pub fn write_digest_note(
 
     let filename = digest_filename(run);
     let path = dir.join(&filename);
-    let content = render_digest_note(run);
+
+    // If a note for this day already exists, MERGE the run's new items into
+    // it rather than overwriting -- so a second same-day run accumulates
+    // items and never clobbers the first run's (or the user's hand-edits),
+    // bd issue drip-47u. The first run of a day renders a fresh note.
+    let content = match fs::read_to_string(&path) {
+        Ok(existing) => merge_digest_note(&existing, run),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => render_digest_note(run),
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!("failed to read existing digest note at {}", path.display())
+            })
+        }
+    };
 
     fs::write(&path, content)
         .with_context(|| format!("failed to write digest note at {}", path.display()))?;
 
     Ok(path)
+}
+
+/// Compute what [`write_digest_note`] WOULD write for `run` right now,
+/// without touching disk: the merge of `run` into the existing same-day note
+/// if one exists, else a fresh render. Backs `drip fetch --dry-run`'s preview
+/// so it reflects the append/merge behavior (bd issue drip-47u).
+pub fn preview_digest_note(
+    vault_path: &Path,
+    posts_folder: &str,
+    run: &DigestRun,
+) -> Result<String> {
+    let path = vault_path.join(posts_folder).join(digest_filename(run));
+    match fs::read_to_string(&path) {
+        Ok(existing) => Ok(merge_digest_note(&existing, run)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(render_digest_note(run)),
+        Err(err) => Err(err).with_context(|| {
+            format!("failed to read existing digest note at {}", path.display())
+        }),
+    }
+}
+
+/// True if `line` (ignoring leading whitespace) is a rendered checkbox task
+/// line -- `- [ ] ...`, or the user-ticked `- [x] ...`/`- [X] ...`. Used by
+/// the merge logic to find where a source's item lines end and to guard
+/// against re-inserting an item already in the note (bd issue drip-47u).
+fn is_item_line(line: &str) -> bool {
+    let t = line.trim_start();
+    t.starts_with("- [ ] ") || t.starts_with("- [x] ") || t.starts_with("- [X] ")
+}
+
+/// The comparable "body" of a checkbox task line: the text after the
+/// `- [ ] `/`- [x] `/`- [X] ` marker. Lets a freshly-rendered `- [ ]` item
+/// and the same item the user has since ticked (`- [x]`) compare equal, so
+/// merging never duplicates an item just because its checkbox state changed.
+/// Non-item lines are returned unchanged.
+fn checkbox_body(line: &str) -> &str {
+    let t = line.trim_start();
+    for marker in ["- [ ] ", "- [x] ", "- [X] "] {
+        if let Some(rest) = t.strip_prefix(marker) {
+            return rest;
+        }
+    }
+    line
+}
+
+/// Insert `item_lines` into `lines` under the `## {topic}` / `### {source}`
+/// headings given, creating either heading (and its section) if absent, and
+/// return how many lines were actually inserted. Mirrors
+/// `journal::insert_reddit_bullet`'s targeted, parse-free line surgery: it
+/// only ever inserts new item lines and (when needed) new headings, and never
+/// rewrites, reorders, or drops an existing line -- so ticked checkboxes and
+/// manual edits between runs survive untouched (bd issue drip-47u). Items
+/// whose `checkbox_body` already appears in the target source subsection are
+/// skipped, keeping a re-run from duplicating a line.
+fn insert_item_lines(
+    lines: &mut Vec<String>,
+    topic_heading: &str,
+    source_heading: &str,
+    item_lines: &[String],
+) -> usize {
+    // 1. Locate the `## {topic}` section, or append a fresh one at EOF.
+    let topic_idx = lines.iter().position(|l| l == topic_heading);
+    let (topic_body_start, topic_end) = match topic_idx {
+        Some(idx) => {
+            let next_h2 = lines[idx + 1..]
+                .iter()
+                .position(|l| l.starts_with("## "))
+                .map(|off| idx + 1 + off);
+            (idx + 1, next_h2.unwrap_or(lines.len()))
+        }
+        None => {
+            if lines.last().map(|l| !l.is_empty()).unwrap_or(false) {
+                lines.push(String::new());
+            }
+            lines.push(topic_heading.to_string());
+            lines.push(String::new());
+            lines.push(source_heading.to_string());
+            lines.push(String::new());
+            let mut inserted = 0;
+            for il in item_lines {
+                lines.push(il.clone());
+                inserted += 1;
+            }
+            return inserted;
+        }
+    };
+
+    // 2. Within the topic section, locate the `### {source}` subsection, or
+    //    splice a fresh one in at the topic section's end.
+    let source_idx = lines[topic_body_start..topic_end]
+        .iter()
+        .position(|l| l == source_heading)
+        .map(|off| topic_body_start + off);
+    let (sub_start, sub_end) = match source_idx {
+        Some(idx) => {
+            let next = lines[idx + 1..topic_end]
+                .iter()
+                .position(|l| l.starts_with("### ") || l.starts_with("## "))
+                .map(|off| idx + 1 + off);
+            (idx + 1, next.unwrap_or(topic_end))
+        }
+        None => {
+            let insert_at = topic_end;
+            let mut block: Vec<String> = Vec::new();
+            if insert_at > 0 && !lines[insert_at - 1].is_empty() {
+                block.push(String::new());
+            }
+            block.push(source_heading.to_string());
+            block.push(String::new());
+            let mut inserted = 0;
+            for il in item_lines {
+                block.push(il.clone());
+                inserted += 1;
+            }
+            // Keep a blank line between the new subsection and whatever
+            // section follows it (e.g. the next `## {topic}`).
+            if insert_at < lines.len() {
+                block.push(String::new());
+            }
+            for (k, line) in block.into_iter().enumerate() {
+                lines.insert(insert_at + k, line);
+            }
+            return inserted;
+        }
+    };
+
+    // 3. Insert into the existing subsection, after its last item line (or
+    //    right after the heading's blank line if it has none yet), skipping
+    //    items already present by `checkbox_body`.
+    let existing_bodies: std::collections::HashSet<String> = lines[sub_start..sub_end]
+        .iter()
+        .filter(|l| is_item_line(l))
+        .map(|l| checkbox_body(l).to_string())
+        .collect();
+
+    let last_item = (sub_start..sub_end).rev().find(|&i| is_item_line(&lines[i]));
+    let mut insert_at = match last_item {
+        Some(i) => i + 1,
+        None => {
+            if sub_start < sub_end && lines[sub_start].is_empty() {
+                sub_start + 1
+            } else {
+                sub_start
+            }
+        }
+    };
+
+    let mut inserted = 0;
+    for il in item_lines {
+        if existing_bodies.contains(checkbox_body(il)) {
+            continue;
+        }
+        lines.insert(insert_at, il.clone());
+        insert_at += 1;
+        inserted += 1;
+    }
+    inserted
+}
+
+/// Merge `run`'s items into an already-existing same-day digest note's text,
+/// returning the updated note. Unlike [`render_digest_note`] (which produces
+/// a fresh note from scratch), this preserves the existing note verbatim --
+/// including ticked checkboxes (`- [x]`) and any manual edits the user made
+/// between runs -- and only *inserts* genuinely-new item lines under the
+/// right `## {topic}` / `### {source}` headings, creating those headings as
+/// needed (bd issue drip-47u). It also bumps `modifiedOn`, grows
+/// `fetched_count` by the number of lines inserted, and extends the
+/// `topics:`/`sources:` frontmatter lists to cover any newly-introduced
+/// group. If nothing new is inserted, the note is returned byte-for-byte
+/// unchanged.
+pub fn merge_digest_note(existing: &str, run: &DigestRun) -> String {
+    let mut lines: Vec<String> = existing.lines().map(|l| l.to_string()).collect();
+
+    let mut total_inserted = 0usize;
+    for (group, items) in &run.items_by_source {
+        if items.is_empty() {
+            continue;
+        }
+        let topic_heading = format!("## {}", group.topic);
+        let source_heading = format!("### {}", group.kind.heading_prefix(&group.name));
+        let item_lines: Vec<String> =
+            items.iter().map(|it| render_item(it, group.kind)).collect();
+        total_inserted +=
+            insert_item_lines(&mut lines, &topic_heading, &source_heading, &item_lines);
+    }
+
+    // Nothing genuinely new -> leave the note exactly as it was (no
+    // frontmatter churn, no rewritten trailing newline).
+    if total_inserted == 0 {
+        return existing.to_string();
+    }
+
+    // Targeted frontmatter updates -- single-line rewrites only, in the
+    // spirit of `journal::bump_modified_on`.
+    let modified_iso = run.created_at.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    for line in lines.iter_mut() {
+        if line.starts_with("modifiedOn: \"") && line.ends_with('"') {
+            *line = format!("modifiedOn: \"{modified_iso}\"");
+            break;
+        }
+    }
+    for line in lines.iter_mut() {
+        if let Some(rest) = line.strip_prefix("fetched_count: ") {
+            if let Ok(n) = rest.trim().parse::<usize>() {
+                *line = format!("fetched_count: {}", n + total_inserted);
+            }
+            break;
+        }
+    }
+    extend_inline_list(&mut lines, "topics: [", &run.topics());
+    extend_inline_list(&mut lines, "sources: [", &run.source_labels());
+
+    let mut result = lines.join("\n");
+    result.push('\n');
+    result
+}
+
+/// Extend an inline frontmatter list line (`topics: [a, b]` / `sources: [...]`)
+/// with any of `additions` not already present, preserving order and the
+/// existing entries. A no-op if the line isn't found. Used by
+/// [`merge_digest_note`] so a group first introduced by a later same-day run
+/// still shows up in the note's frontmatter.
+fn extend_inline_list(lines: &mut [String], prefix: &str, additions: &[String]) {
+    for line in lines.iter_mut() {
+        if let Some(rest) = line.strip_prefix(prefix) {
+            let inner = rest.trim_end().strip_suffix(']').unwrap_or(rest);
+            let mut current: Vec<String> = if inner.trim().is_empty() {
+                Vec::new()
+            } else {
+                inner.split(", ").map(|s| s.to_string()).collect()
+            };
+            for add in additions {
+                if !current.iter().any(|c| c == add) {
+                    current.push(add.clone());
+                }
+            }
+            *line = format!("{prefix}{}]", current.join(", "));
+            break;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -813,5 +1066,139 @@ mod tests {
         assert!(note.contains("## Rust"));
         assert!(note.contains("### r/rust-hot"));
         assert!(!note.contains("\n\n\n"));
+    }
+
+    // -- merge (append into an existing same-day note) tests: bd issue drip-47u --
+
+    #[test]
+    fn merge_is_a_byte_for_byte_no_op_when_the_run_has_nothing_new() {
+        let run = sample_run(vec![("rust".to_string(), vec![sample_item("a", "Post A")])]);
+        let existing = render_digest_note(&run);
+
+        let merged = merge_digest_note(&existing, &run);
+
+        assert_eq!(
+            merged, existing,
+            "merging a run whose items are all already present must not change the note"
+        );
+    }
+
+    #[test]
+    fn merge_appends_a_new_item_under_the_existing_topic_and_source() {
+        let run1 = sample_run(vec![("rust".to_string(), vec![sample_item("a", "Post A")])]);
+        let existing = render_digest_note(&run1);
+
+        let run2 = sample_run(vec![("rust".to_string(), vec![sample_item("b", "Post B")])]);
+        let merged = merge_digest_note(&existing, &run2);
+
+        assert!(merged.contains("Post A"), "existing item must survive:\n{merged}");
+        assert!(merged.contains("Post B"), "new item must be appended:\n{merged}");
+        assert_eq!(merged.matches("## Programming").count(), 1);
+        assert_eq!(merged.matches("### r/rust").count(), 1);
+        assert!(merged.find("Post A").unwrap() < merged.find("Post B").unwrap());
+        assert!(!merged.contains("\n\n\n"));
+    }
+
+    #[test]
+    fn merge_preserves_a_ticked_checkbox_and_a_manual_edit() {
+        let run1 = sample_run(vec![("rust".to_string(), vec![sample_item("a", "Post A")])]);
+        let rendered = render_digest_note(&run1);
+        let edited = rendered.replace("- [ ] **[Post A]", "- [x] **[Post A]")
+            + "\nMy manual note under the digest.\n";
+
+        let run2 = sample_run(vec![("rust".to_string(), vec![sample_item("b", "Post B")])]);
+        let merged = merge_digest_note(&edited, &run2);
+
+        assert!(
+            merged.contains("- [x] **[Post A]"),
+            "ticked checkbox must not be reset to - [ ]:\n{merged}"
+        );
+        assert!(
+            merged.contains("My manual note under the digest."),
+            "manual edit must survive the merge:\n{merged}"
+        );
+        assert!(merged.contains("Post B"), "new item still appended:\n{merged}");
+    }
+
+    #[test]
+    fn merge_does_not_duplicate_an_item_even_after_it_was_ticked() {
+        let run1 = sample_run(vec![("rust".to_string(), vec![sample_item("a", "Post A")])]);
+        let rendered = render_digest_note(&run1);
+        let edited = rendered.replace("- [ ] **[Post A]", "- [x] **[Post A]");
+
+        let merged = merge_digest_note(&edited, &run1);
+
+        assert_eq!(
+            merged.matches("Post A").count(),
+            1,
+            "item must not be duplicated after being ticked:\n{merged}"
+        );
+        assert!(merged.contains("- [x] **[Post A]"));
+    }
+
+    #[test]
+    fn merge_adds_a_new_source_subsection_under_an_existing_topic() {
+        let run1 = sample_run(vec![("rust".to_string(), vec![sample_item("a", "Post A")])]);
+        let existing = render_digest_note(&run1);
+
+        let run2 = sample_run(vec![("golang".to_string(), vec![sample_item("b", "Post B")])]);
+        let merged = merge_digest_note(&existing, &run2);
+
+        assert_eq!(merged.matches("## Programming").count(), 1, "one topic heading:\n{merged}");
+        assert!(merged.contains("### r/rust"));
+        assert!(merged.contains("### r/golang"));
+        assert!(merged.contains("Post A") && merged.contains("Post B"));
+        assert!(!merged.contains("\n\n\n"));
+    }
+
+    #[test]
+    fn merge_adds_a_brand_new_topic_section() {
+        let run1 = sample_run_with_topics(vec![(
+            "Programming".to_string(),
+            "rust".to_string(),
+            vec![sample_item("a", "Post A")],
+        )]);
+        let existing = render_digest_note(&run1);
+
+        let run2 = sample_run_with_topics(vec![(
+            "News".to_string(),
+            "worldnews".to_string(),
+            vec![sample_item("b", "Post B")],
+        )]);
+        let merged = merge_digest_note(&existing, &run2);
+
+        assert!(merged.contains("## Programming"));
+        assert!(merged.contains("## News"));
+        assert!(merged.find("## Programming").unwrap() < merged.find("## News").unwrap());
+        assert!(merged.contains("Post A") && merged.contains("Post B"));
+        assert!(merged.contains("topics: [Programming, News]"), "frontmatter topics extended:\n{merged}");
+        assert!(!merged.contains("\n\n\n"));
+    }
+
+    #[test]
+    fn merge_bumps_fetched_count_and_modified_on() {
+        let run1 = sample_run(vec![("rust".to_string(), vec![sample_item("a", "Post A")])]);
+        let existing = render_digest_note(&run1);
+        assert!(existing.contains("fetched_count: 1"));
+
+        let mut run2 = sample_run(vec![("rust".to_string(), vec![sample_item("b", "Post B")])]);
+        run2.created_at = Utc.with_ymd_and_hms(2026, 7, 8, 18, 0, 0).unwrap();
+        let merged = merge_digest_note(&existing, &run2);
+
+        assert!(merged.contains("fetched_count: 2"), "count should grow by inserted lines:\n{merged}");
+        assert!(merged.contains("modifiedOn: \"2026-07-08T18:00:00Z\""), "modifiedOn should bump:\n{merged}");
+        assert!(merged.contains("createdOn: \"2026-07-08T14:32:10Z\""), "createdOn must not change:\n{merged}");
+    }
+
+    #[test]
+    fn merge_extends_the_sources_frontmatter_list_for_a_new_source() {
+        let run1 = sample_run(vec![("rust".to_string(), vec![sample_item("a", "Post A")])]);
+        let existing = render_digest_note(&run1);
+        assert!(existing.contains("sources: [rust]"));
+
+        let run2 = sample_run(vec![("golang".to_string(), vec![sample_item("b", "Post B")])]);
+        let merged = merge_digest_note(&existing, &run2);
+
+        assert!(merged.contains("sources: [rust, golang]"), "sources list should extend:\n{merged}");
     }
 }
