@@ -268,7 +268,10 @@ pub fn render_digest_note(run: &DigestRun) -> String {
             if group.topic != topic {
                 continue;
             }
-            out.push_str(&format!("### {}\n\n", group.kind.heading_prefix(&group.name)));
+            out.push_str(&format!(
+                "### {}\n\n",
+                group.kind.heading_prefix(&group.name)
+            ));
             for item in items {
                 out.push_str(&render_item(item, group.kind));
                 out.push('\n');
@@ -337,9 +340,8 @@ pub fn preview_digest_note(
     match fs::read_to_string(&path) {
         Ok(existing) => Ok(merge_digest_note(&existing, run)),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(render_digest_note(run)),
-        Err(err) => Err(err).with_context(|| {
-            format!("failed to read existing digest note at {}", path.display())
-        }),
+        Err(err) => Err(err)
+            .with_context(|| format!("failed to read existing digest note at {}", path.display())),
     }
 }
 
@@ -457,7 +459,9 @@ fn insert_item_lines(
         .map(|l| checkbox_body(l).to_string())
         .collect();
 
-    let last_item = (sub_start..sub_end).rev().find(|&i| is_item_line(&lines[i]));
+    let last_item = (sub_start..sub_end)
+        .rev()
+        .find(|&i| is_item_line(&lines[i]));
     let mut insert_at = match last_item {
         Some(i) => i + 1,
         None => {
@@ -502,8 +506,7 @@ pub fn merge_digest_note(existing: &str, run: &DigestRun) -> String {
         }
         let topic_heading = format!("## {}", group.topic);
         let source_heading = format!("### {}", group.kind.heading_prefix(&group.name));
-        let item_lines: Vec<String> =
-            items.iter().map(|it| render_item(it, group.kind)).collect();
+        let item_lines: Vec<String> = items.iter().map(|it| render_item(it, group.kind)).collect();
         total_inserted +=
             insert_item_lines(&mut lines, &topic_heading, &source_heading, &item_lines);
     }
@@ -902,8 +905,14 @@ mod tests {
 
         let note = render_digest_note(&run);
 
-        assert!(note.contains("tags: []\n"), "expected inline empty tags array:\n{note}");
-        assert!(!note.contains("tags:\n\n"), "must not emit a bare tags key with a blank line:\n{note}");
+        assert!(
+            note.contains("tags: []\n"),
+            "expected inline empty tags array:\n{note}"
+        );
+        assert!(
+            !note.contains("tags:\n\n"),
+            "must not emit a bare tags key with a blank line:\n{note}"
+        );
     }
 
     #[test]
@@ -914,7 +923,10 @@ mod tests {
         assert_eq!(filename, "2026-07-08 - Daily digest.md");
         assert!(!filename.contains('('));
         assert!(!filename.contains(')'));
-        assert!(!filename.contains("1432"), "filename must not include a time-of-day:\n{filename}");
+        assert!(
+            !filename.contains("1432"),
+            "filename must not include a time-of-day:\n{filename}"
+        );
         assert!(filename.ends_with(".md"));
     }
 
@@ -933,7 +945,10 @@ mod tests {
             digest_filename(&single_source_run),
             digest_filename(&multi_source_run)
         );
-        assert_eq!(digest_filename(&single_source_run), "2026-07-08 - Daily digest.md");
+        assert_eq!(
+            digest_filename(&single_source_run),
+            "2026-07-08 - Daily digest.md"
+        );
     }
 
     #[test]
@@ -1030,7 +1045,10 @@ mod tests {
         let note = render_digest_note(&run);
 
         let h2_count = note.lines().filter(|l| l.starts_with("## ")).count();
-        assert_eq!(h2_count, 2, "expected exactly two H2 topic headings:\n{note}");
+        assert_eq!(
+            h2_count, 2,
+            "expected exactly two H2 topic headings:\n{note}"
+        );
         let claude_idx = note.find("## Claude").expect("expected a Claude heading");
         let rust_idx = note.find("## Rust").expect("expected a Rust heading");
         assert!(
@@ -1091,8 +1109,14 @@ mod tests {
         let run2 = sample_run(vec![("rust".to_string(), vec![sample_item("b", "Post B")])]);
         let merged = merge_digest_note(&existing, &run2);
 
-        assert!(merged.contains("Post A"), "existing item must survive:\n{merged}");
-        assert!(merged.contains("Post B"), "new item must be appended:\n{merged}");
+        assert!(
+            merged.contains("Post A"),
+            "existing item must survive:\n{merged}"
+        );
+        assert!(
+            merged.contains("Post B"),
+            "new item must be appended:\n{merged}"
+        );
         assert_eq!(merged.matches("## Programming").count(), 1);
         assert_eq!(merged.matches("### r/rust").count(), 1);
         assert!(merged.find("Post A").unwrap() < merged.find("Post B").unwrap());
@@ -1117,7 +1141,10 @@ mod tests {
             merged.contains("My manual note under the digest."),
             "manual edit must survive the merge:\n{merged}"
         );
-        assert!(merged.contains("Post B"), "new item still appended:\n{merged}");
+        assert!(
+            merged.contains("Post B"),
+            "new item still appended:\n{merged}"
+        );
     }
 
     #[test]
@@ -1141,10 +1168,17 @@ mod tests {
         let run1 = sample_run(vec![("rust".to_string(), vec![sample_item("a", "Post A")])]);
         let existing = render_digest_note(&run1);
 
-        let run2 = sample_run(vec![("golang".to_string(), vec![sample_item("b", "Post B")])]);
+        let run2 = sample_run(vec![(
+            "golang".to_string(),
+            vec![sample_item("b", "Post B")],
+        )]);
         let merged = merge_digest_note(&existing, &run2);
 
-        assert_eq!(merged.matches("## Programming").count(), 1, "one topic heading:\n{merged}");
+        assert_eq!(
+            merged.matches("## Programming").count(),
+            1,
+            "one topic heading:\n{merged}"
+        );
         assert!(merged.contains("### r/rust"));
         assert!(merged.contains("### r/golang"));
         assert!(merged.contains("Post A") && merged.contains("Post B"));
@@ -1171,7 +1205,10 @@ mod tests {
         assert!(merged.contains("## News"));
         assert!(merged.find("## Programming").unwrap() < merged.find("## News").unwrap());
         assert!(merged.contains("Post A") && merged.contains("Post B"));
-        assert!(merged.contains("topics: [Programming, News]"), "frontmatter topics extended:\n{merged}");
+        assert!(
+            merged.contains("topics: [Programming, News]"),
+            "frontmatter topics extended:\n{merged}"
+        );
         assert!(!merged.contains("\n\n\n"));
     }
 
@@ -1185,9 +1222,18 @@ mod tests {
         run2.created_at = Utc.with_ymd_and_hms(2026, 7, 8, 18, 0, 0).unwrap();
         let merged = merge_digest_note(&existing, &run2);
 
-        assert!(merged.contains("fetched_count: 2"), "count should grow by inserted lines:\n{merged}");
-        assert!(merged.contains("modifiedOn: \"2026-07-08T18:00:00Z\""), "modifiedOn should bump:\n{merged}");
-        assert!(merged.contains("createdOn: \"2026-07-08T14:32:10Z\""), "createdOn must not change:\n{merged}");
+        assert!(
+            merged.contains("fetched_count: 2"),
+            "count should grow by inserted lines:\n{merged}"
+        );
+        assert!(
+            merged.contains("modifiedOn: \"2026-07-08T18:00:00Z\""),
+            "modifiedOn should bump:\n{merged}"
+        );
+        assert!(
+            merged.contains("createdOn: \"2026-07-08T14:32:10Z\""),
+            "createdOn must not change:\n{merged}"
+        );
     }
 
     #[test]
@@ -1196,9 +1242,15 @@ mod tests {
         let existing = render_digest_note(&run1);
         assert!(existing.contains("sources: [rust]"));
 
-        let run2 = sample_run(vec![("golang".to_string(), vec![sample_item("b", "Post B")])]);
+        let run2 = sample_run(vec![(
+            "golang".to_string(),
+            vec![sample_item("b", "Post B")],
+        )]);
         let merged = merge_digest_note(&existing, &run2);
 
-        assert!(merged.contains("sources: [rust, golang]"), "sources list should extend:\n{merged}");
+        assert!(
+            merged.contains("sources: [rust, golang]"),
+            "sources list should extend:\n{merged}"
+        );
     }
 }

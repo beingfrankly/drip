@@ -87,8 +87,7 @@ pub fn fetch(url: &str, verbose: bool, max_retries: u32, base: Duration) -> Fetc
         Ok(http) => http,
         Err(err) => {
             return FetchOutcome::Failed(
-                anyhow::Error::new(err)
-                    .context("failed to build HTTP client for RSS/Atom fetch"),
+                anyhow::Error::new(err).context("failed to build HTTP client for RSS/Atom fetch"),
             )
         }
     };
@@ -149,9 +148,12 @@ pub fn fetch(url: &str, verbose: bool, max_retries: u32, base: Duration) -> Fetc
         };
 
         return match feed_rs::parser::parse(bytes.as_ref()) {
-            Ok(feed) => FetchOutcome::Fetched(feed.entries.into_iter().map(entry_to_item).collect()),
+            Ok(feed) => {
+                FetchOutcome::Fetched(feed.entries.into_iter().map(entry_to_item).collect())
+            }
             Err(err) => FetchOutcome::Failed(
-                anyhow::Error::new(err).context(format!("failed to parse feed at {url} as RSS/Atom")),
+                anyhow::Error::new(err)
+                    .context(format!("failed to parse feed at {url} as RSS/Atom")),
             ),
         };
     }
@@ -364,10 +366,7 @@ mod tests {
     #[test]
     fn fetch_succeeds_after_a_single_429() {
         let mut server = mockito::Server::new();
-        let rate_limited = server
-            .mock("GET", "/feed.xml")
-            .with_status(429)
-            .create();
+        let rate_limited = server.mock("GET", "/feed.xml").with_status(429).create();
         let ok = server
             .mock("GET", "/feed.xml")
             .with_status(200)
@@ -380,9 +379,7 @@ mod tests {
 
         let items = match outcome {
             FetchOutcome::Fetched(items) => items,
-            other => panic!(
-                "fetch should succeed after retrying past the 429, got: {other:?}"
-            ),
+            other => panic!("fetch should succeed after retrying past the 429, got: {other:?}"),
         };
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].title, "First RSS post");

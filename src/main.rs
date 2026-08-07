@@ -1943,8 +1943,14 @@ mod tests {
         // Still exactly one digest note for the day, now holding BOTH sources'
         // items: 'a' (from run 1, not clobbered) and 'b' (merged in on run 2).
         let note = read_only_digest_note(vault_dir.path());
-        assert!(note.contains("Post from a"), "run-1 item must survive the second run:\n{note}");
-        assert!(note.contains("Post from b"), "run-2 item must be merged in:\n{note}");
+        assert!(
+            note.contains("Post from a"),
+            "run-1 item must survive the second run:\n{note}"
+        );
+        assert!(
+            note.contains("Post from b"),
+            "run-2 item must be merged in:\n{note}"
+        );
     }
 
     #[test]
@@ -1964,7 +1970,10 @@ mod tests {
         handle_fetch(&fetch_args(&["a"]), &config).expect("second fetch should succeed");
         let after_second = read_only_digest_note(vault_dir.path());
 
-        assert_eq!(after_first, after_second, "a no-new-items re-run must not change the note");
+        assert_eq!(
+            after_first, after_second,
+            "a no-new-items re-run must not change the note"
+        );
         assert!(after_first.contains("Post from a"));
     }
 }

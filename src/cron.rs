@@ -289,7 +289,13 @@ mod tests {
         // line follows it) -- should not panic, should just replace the
         // marker line itself and append the new block after it.
         let existing = format!("# some other cron job\n0 5 * * * /usr/bin/backup.sh\n{MARKER}\n");
-        let new_block = build_line(9, 30, "/path/to/drip", "--source rust", "~/.local/log/drip.log");
+        let new_block = build_line(
+            9,
+            30,
+            "/path/to/drip",
+            "--source rust",
+            "~/.local/log/drip.log",
+        );
         let result = upsert_line(&existing, MARKER, &new_block);
 
         assert_eq!(

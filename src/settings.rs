@@ -277,7 +277,9 @@ pub fn validate_and_encode(key: &str, value: &str) -> Result<String> {
         }
         "reddit_retry_max" => {
             let max: u32 = value.parse().with_context(|| {
-                format!("'{value}' is not a valid retry count (expected a non-negative whole number)")
+                format!(
+                    "'{value}' is not a valid retry count (expected a non-negative whole number)"
+                )
             })?;
             Ok(max.to_string())
         }

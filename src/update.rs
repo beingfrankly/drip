@@ -146,7 +146,10 @@ pub fn expected_asset_name() -> Option<&'static str> {
 /// Find the asset in `release.assets` whose `name` exactly equals
 /// `expected_name`, if any.
 pub fn find_asset<'a>(release: &'a GithubRelease, expected_name: &str) -> Option<&'a GithubAsset> {
-    release.assets.iter().find(|asset| asset.name == expected_name)
+    release
+        .assets
+        .iter()
+        .find(|asset| asset.name == expected_name)
 }
 
 /// Download the file at `url` to `dest` via a blocking GET. Response bodies
@@ -332,9 +335,8 @@ pub fn install_binary(new_binary: &Path, current_exe: &Path) -> Result<()> {
         std::os::unix::fs::PermissionsExt::from_mode(0o755),
     ) {
         let _ = std::fs::remove_file(&temp_path);
-        return Err(err).with_context(|| {
-            format!("failed to mark {} as executable", temp_path.display())
-        });
+        return Err(err)
+            .with_context(|| format!("failed to mark {} as executable", temp_path.display()));
     }
 
     if let Err(err) = std::fs::rename(&temp_path, current_exe) {
@@ -541,7 +543,10 @@ mod tests {
 
         assert_eq!(release.tag_name, "v0.1.0");
         assert_eq!(release.assets.len(), 1);
-        assert_eq!(release.assets[0].name, "drip-x86_64-unknown-linux-gnu.tar.xz");
+        assert_eq!(
+            release.assets[0].name,
+            "drip-x86_64-unknown-linux-gnu.tar.xz"
+        );
         assert_eq!(
             release.assets[0].browser_download_url,
             "https://github.com/beingfrankly/drip/releases/download/v0.1.0/drip-x86_64-unknown-linux-gnu.tar.xz"
@@ -622,7 +627,9 @@ mod tests {
         std::fs::write(&binary_path, binary_content).expect("write fake binary");
 
         let archive_dir = tempfile::tempdir().expect("tempdir for archive itself");
-        let archive_path = archive_dir.path().join("drip-x86_64-unknown-linux-gnu.tar.xz");
+        let archive_path = archive_dir
+            .path()
+            .join("drip-x86_64-unknown-linux-gnu.tar.xz");
 
         let status = Command::new("tar")
             .arg("-cJf")
@@ -632,11 +639,14 @@ mod tests {
             .arg(subdir_name)
             .status()
             .expect("failed to run tar to build the test fixture");
-        assert!(status.success(), "tar -cJf should succeed building the fixture");
+        assert!(
+            status.success(),
+            "tar -cJf should succeed building the fixture"
+        );
 
         let dest_dir = tempfile::tempdir().expect("tempdir for extraction destination");
-        let extracted = extract_binary(&archive_path, dest_dir.path())
-            .expect("extract_binary should succeed");
+        let extracted =
+            extract_binary(&archive_path, dest_dir.path()).expect("extract_binary should succeed");
 
         assert_eq!(extracted, dest_dir.path().join(subdir_name).join("drip"));
         assert_eq!(extracted.file_name().unwrap(), "drip");
