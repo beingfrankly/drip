@@ -29,7 +29,7 @@ So the order is always: `drip topic add --name <main>` → `drip topic add --nam
 `--url`'s meaning depends on `--kind`:
 
 - `--kind rss`: a genuine RSS/Atom feed URL (e.g. `https://blog.rust-lang.org/feed.xml`).
-- `--kind youtube`: a channel id (starts with `UC`) or a `https://www.youtube.com/channel/UC.../` URL. Handle-style URLs (`/@name`) are **not** supported — resolving those to a channel id needs an extra request; find the canonical channel id/URL instead (channel's About page, or page source for `"channelId":"UC...`).
+- `--kind youtube`: a channel id (starts with `UC`), a `https://www.youtube.com/channel/UC.../` URL, or a `@handle` / `https://www.youtube.com/@handle` URL (bd issue drip-ho5.11) — the form YouTube shows in its own address bar today. A `@handle` resolves via a one-time network fetch of the handle's channel page at `source add` time (scraping its channel id out of the page markup); the other forms resolve with no network. Either way, the *stored* source is always the resolved `feeds/videos.xml?channel_id=UC...` URL, so ordinary fetches never make an extra request. `/c/{name}` and `/user/{name}` custom-URL forms remain unsupported — find the channel's canonical channel id/URL instead (channel's About page, or page source for `"channelId":"UC...`). If handle resolution fails (network error, handle not found, or no channel id found on the page), the error explains that and tells you to pass the `UC...` channel id directly instead.
 - `--kind reddit`: the **bare subreddit name** (e.g. `rust`), not a URL — `drip` builds the subreddit's own public RSS/Atom feed URL from it.
 
 Reddit-only flags on `source add` (ignored for other kinds):

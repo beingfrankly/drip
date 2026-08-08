@@ -294,12 +294,15 @@ pub struct SourceAddArgs {
     #[arg(long, value_enum)]
     pub kind: SourceKind,
     /// The feed URL for `--kind rss`. For `--kind youtube`, also accepts a
-    /// bare YouTube channel id (starts with "UC") or a
-    /// https://www.youtube.com/channel/UC.../ URL -- see `src/youtube.rs`
-    /// for how that gets resolved to the channel's Atom feed URL. For
-    /// `--kind reddit`, this is the bare subreddit name (e.g. `rust`), not a
-    /// URL -- see `src/reddit_feed.rs` for how that gets resolved to a
-    /// subreddit RSS/Atom feed URL.
+    /// bare YouTube channel id (starts with "UC"), a
+    /// https://www.youtube.com/channel/UC.../ URL, or a @handle /
+    /// https://www.youtube.com/@handle URL -- see `src/youtube.rs` for how
+    /// that gets resolved to the channel's Atom feed URL (a @handle
+    /// resolves via a one-time network fetch at `source add` time; the
+    /// other forms resolve with no network). For `--kind reddit`, this is
+    /// the bare subreddit name (e.g. `rust`), not a URL -- see
+    /// `src/reddit_feed.rs` for how that gets resolved to a subreddit
+    /// RSS/Atom feed URL.
     #[arg(long)]
     pub url: String,
     #[arg(long)]

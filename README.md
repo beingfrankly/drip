@@ -109,10 +109,10 @@ drip fetch --source rust-blog
 drip fetch --source rust-hot,rust-blog --dry-run
 ```
 
-YouTube channels work the same way — `drip` fetches a channel's own Atom feed, so no YouTube API key is needed. Pass either the channel id (starts with `UC`) or its `https://www.youtube.com/channel/UC.../` URL — handle URLs like `/@name` aren't supported, since resolving those to a channel id needs an extra request; find the canonical channel id/URL instead (e.g. via the channel's About page, or by viewing page source for `"channelId":"UC...`):
+YouTube channels work the same way — `drip` fetches a channel's own Atom feed, so no YouTube API key is needed. Pass the channel id (starts with `UC`), its `https://www.youtube.com/channel/UC.../` URL, or a `@handle` (or `https://www.youtube.com/@handle` URL) — the form YouTube shows in its own address bar today. A `@handle` is resolved to its channel id with a one-time fetch of the handle's channel page when you run `source add`; the other forms need no network at all. Either way, what's saved is always the resolved feed URL, so ordinary fetches never make an extra request. `/c/{name}` and `/user/{name}` custom-URL forms still aren't supported; if a handle fails to resolve (network error, handle not found, or no channel id found on the page), find the canonical channel id/URL instead (e.g. via the channel's About page, or by viewing page source for `"channelId":"UC...`):
 
 ```bash
-drip source add --kind youtube --url UC_x5XG1OV2P6uZZ5FSM9Ttw --name gfd --topic "rust news"
+drip source add --kind youtube --url @mattpocockuk --name gfd --topic "rust news"
 drip fetch --source gfd
 ```
 
