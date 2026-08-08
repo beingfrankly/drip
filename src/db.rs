@@ -455,15 +455,25 @@ mod tests {
         );
     }
 
-    /// Migration 0006 ("topic tree", bd issue drip-ho5.2 / drip-98u.10) is
-    /// shape-only in this cycle: it must exist, bump `user_version` to 6,
-    /// and -- above all -- must not lose any pre-existing data. This test
-    /// does not exercise the backfill (the `<name> (general)` sub-topics,
-    /// ruleless links, or nulling `sources.topic_id`) -- that's a later
-    /// cycle's job (see the migration's own header comment). It only proves
-    /// migration 0006 is safe to apply against a real pre-0006 database
-    /// shape: a topic, a source that belongs to it, and a non-trivial
-    /// dedup ledger (`seen_items`) all survive untouched.
+    /// Migration 0006 ("topic tree", bd issue drip-ho5.2 / drip-98u.10)
+    /// must exist, must bump `user_version` to 6, and -- above all -- must
+    /// not lose any pre-existing data. That last point is what this test is
+    /// really for: 0006 ships schema AND backfill in one file (the split
+    /// into "a later migration's job" was abandoned, see the migration's own
+    /// header comment), and its backfill both writes into `topics` while
+    /// selecting from it and runs a blanket `UPDATE sources SET topic_id =
+    /// NULL` -- destructive-looking statements that a user's real, populated
+    /// database has to survive. So this seeds a realistic pre-0006 shape --
+    /// a topic, a source belonging to it, and a non-trivial `seen_items`
+    /// dedup ledger -- and proves all of it is still there afterwards,
+    /// untouched.
+    ///
+    /// The backfill's own OUTPUT (the `<name> (general)` sub-topics, the
+    /// ruleless links, the nulled `sources.topic_id`) is verified by the
+    /// sibling test below,
+    /// `migration_0006_backfill_creates_main_and_general_sub_topics`, not
+    /// here -- keeping "0006 destroys nothing" provable independently of
+    /// whatever shape the backfill produces.
     #[test]
     fn migration_0006_preserves_existing_data_and_bumps_version_to_6() {
         let conn = Connection::open_in_memory().expect("failed to open in-memory connection");
