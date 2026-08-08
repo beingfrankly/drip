@@ -96,7 +96,8 @@ mod tests {
         let source_id = sources::upsert_reddit_source(&conn, "rust").unwrap();
 
         let item = sample_item("abc123", "First post");
-        record_seen(&conn, source_id, &[item.clone()]).expect("record_seen should succeed");
+        record_seen(&conn, source_id, std::slice::from_ref(&item))
+            .expect("record_seen should succeed");
 
         let filtered =
             filter_unseen(&conn, source_id, vec![item]).expect("filter_unseen should succeed");
@@ -114,7 +115,7 @@ mod tests {
         let source_programming = sources::upsert_reddit_source(&conn, "programming").unwrap();
 
         let item = sample_item("abc123", "Crossposted post");
-        record_seen(&conn, source_rust, &[item.clone()])
+        record_seen(&conn, source_rust, std::slice::from_ref(&item))
             .expect("record_seen for r/rust should succeed");
 
         // Seeing the item in r/rust must NOT suppress it in r/programming --
@@ -136,8 +137,9 @@ mod tests {
 
         let item = sample_item("abc123", "First post");
 
-        record_seen(&conn, source_id, &[item.clone()]).expect("first record_seen should succeed");
-        record_seen(&conn, source_id, &[item.clone()])
+        record_seen(&conn, source_id, std::slice::from_ref(&item))
+            .expect("first record_seen should succeed");
+        record_seen(&conn, source_id, std::slice::from_ref(&item))
             .expect("second record_seen should not error on duplicate");
 
         let count: i64 = conn
