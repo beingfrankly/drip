@@ -995,13 +995,20 @@ fn handle_topic(action: &TopicAction, config: &Config) -> Result<()> {
             println!("created topic '{name}'");
         }
         TopicAction::Remove { name } => {
-            // Check existence + emptiness before ever touching
-            // `remove_topic` (bd issue drip-38w.2): a missing topic stays
-            // the pre-existing benign "no topic named" print (not an error),
-            // while a non-empty one is refused with an actionable message
-            // rather than surfacing the raw FK `RESTRICT` error `remove_topic`
-            // itself would otherwise hit.
-            let count = match topics::topic_source_count(&conn, name) {
+            // Check existence + "any descendant" before ever touching
+            // `remove_topic` (bd issue drip-ho5.4, per drip-98u.7's
+            // resolution "refuse while any descendant exists"): a missing
+            // topic stays the pre-existing benign "no topic named" print
+            // (not an error); a main topic that still has sub-topics is
+            // refused citing them; a topic (main or sub) that still has a
+            // direct source link is refused citing that -- either way with
+            // an actionable message rather than surfacing the raw FK
+            // `RESTRICT` error `remove_topic` itself would otherwise hit.
+            // The child-count check runs first: for a main topic with
+            // sub-topics, "remove the sub-topics first" is the actionable
+            // fix, even if (contrary to the intended leaf-only-attachment
+            // model) the main also happens to carry a direct legacy link.
+            let child_count = match topics::topic_child_count(&conn, name) {
                 Ok(count) => count,
                 Err(_) => {
                     println!("no topic named '{name}'");
@@ -1009,11 +1016,18 @@ fn handle_topic(action: &TopicAction, config: &Config) -> Result<()> {
                 }
             };
 
-            if count > 0 {
+            if child_count > 0 {
                 anyhow::bail!(
-                    "topic '{name}' still has {count} source(s); move them to another topic \
-                     first (e.g. `drip source move --name <label> --topic <other>`) before \
-                     removing it"
+                    "topic '{name}' still has {child_count} sub-topic(s); remove them first"
+                );
+            }
+
+            let link_count = topics::topic_link_count(&conn, name)?;
+            if link_count > 0 {
+                anyhow::bail!(
+                    "topic '{name}' still has {link_count} source(s); move them to another \
+                     topic first (e.g. `drip source move --name <label> --topic <other>`) \
+                     before removing it"
                 );
             }
 
@@ -1021,15 +1035,29 @@ fn handle_topic(action: &TopicAction, config: &Config) -> Result<()> {
             println!("removed topic '{name}'");
         }
         TopicAction::List => {
+            // `list_topics` already groups each main topic with its own
+            // sub-topics in display order (bd issue drip-ho5.4); render that
+            // as a two-level tree by indenting any row that has a parent
+            // (a sub-topic) two spaces under its main topic, rather than a
+            // flat list that no longer distinguishes the two.
             let saved = topics::list_topics(&conn)?;
             if saved.is_empty() {
                 println!("no topics saved yet");
             } else {
                 for topic in &saved {
-                    if topic.source_labels.is_empty() {
-                        println!("- {} (no sources)", topic.name);
+                    let indent = if topic.parent_name.is_some() {
+                        "  "
                     } else {
-                        println!("- {}: {}", topic.name, topic.source_labels.join(", "));
+                        ""
+                    };
+                    if topic.source_labels.is_empty() {
+                        println!("{indent}- {} (no sources)", topic.name);
+                    } else {
+                        println!(
+                            "{indent}- {}: {}",
+                            topic.name,
+                            topic.source_labels.join(", ")
+                        );
                     }
                 }
             }
@@ -1599,6 +1627,113 @@ mod tests {
         assert!(sources::find_by_label(&conn, "rust-blog")
             .unwrap()
             .is_some());
+    }
+
+    // -- Cycle B (bd issue drip-ho5.4): `drip topic remove` gains a second
+    // guard for the two-level tree -- a main topic refuses removal while it
+    // has sub-topics, distinct from the existing "still has sources" guard
+    // for a topic (main or sub) that still has a direct link (drip-98u.7).
+
+    #[test]
+    fn handle_topic_remove_refuses_a_main_topic_with_a_sub_topic_via_the_guard_not_a_raw_fk_error()
+    {
+        let (_dir, config) = fresh_config();
+        let conn = db::open(&config).unwrap();
+        let tid_claude = topics::create_topic(&conn, "Claude").unwrap();
+        topics::make_sub_topic(&conn, tid_claude, "Claude (general)");
+        drop(conn);
+
+        let err = handle_topic(
+            &TopicAction::Remove {
+                name: "Claude".to_string(),
+            },
+            &config,
+        )
+        .expect_err("removing a main topic with a sub-topic should be refused");
+
+        let message = err.to_string();
+        assert!(
+            message.contains("sub-topic"),
+            "error should mention it still has sub-topics: {message}"
+        );
+        assert!(
+            !message.to_lowercase().contains("foreign key"),
+            "the guard should produce a clear message, not a raw SQLite FK error: {message}"
+        );
+
+        // Nothing should have been deleted.
+        let conn = db::open(&config).unwrap();
+        let listed = topics::list_topics(&conn).unwrap();
+        assert!(listed.iter().any(|t| t.name == "Claude"));
+        assert!(listed.iter().any(|t| t.name == "Claude (general)"));
+    }
+
+    #[test]
+    fn handle_topic_remove_refuses_a_sub_topic_with_a_source_link() {
+        let (_dir, config) = fresh_config();
+        let sub_id = {
+            let conn = db::open(&config).unwrap();
+            let tid_claude = topics::create_topic(&conn, "Claude").unwrap();
+            let sub_id = topics::make_sub_topic(&conn, tid_claude, "Claude (general)");
+            sources::upsert_source(
+                &conn,
+                SourceKind::Rss,
+                "https://example.com/s1.xml",
+                Some("s1"),
+                sub_id,
+            )
+            .unwrap();
+            sub_id
+        };
+        assert!(sub_id > 0);
+
+        let err = handle_topic(
+            &TopicAction::Remove {
+                name: "Claude (general)".to_string(),
+            },
+            &config,
+        )
+        .expect_err("removing a sub-topic with a linked source should be refused");
+
+        let message = err.to_string();
+        assert!(
+            message.contains("source"),
+            "error should mention it still has sources: {message}"
+        );
+        assert!(
+            message.contains("move"),
+            "error should point at `drip source move`: {message}"
+        );
+
+        let conn = db::open(&config).unwrap();
+        assert!(topics::list_topics(&conn)
+            .unwrap()
+            .iter()
+            .any(|t| t.name == "Claude (general)"));
+    }
+
+    #[test]
+    fn handle_topic_remove_of_an_empty_leaf_sub_topic_succeeds() {
+        let (_dir, config) = fresh_config();
+        {
+            let conn = db::open(&config).unwrap();
+            let tid_claude = topics::create_topic(&conn, "Claude").unwrap();
+            topics::make_sub_topic(&conn, tid_claude, "Claude (general)");
+        }
+
+        handle_topic(
+            &TopicAction::Remove {
+                name: "Claude (general)".to_string(),
+            },
+            &config,
+        )
+        .expect("removing an empty leaf sub-topic should succeed");
+
+        let conn = db::open(&config).unwrap();
+        assert!(!topics::list_topics(&conn)
+            .unwrap()
+            .iter()
+            .any(|t| t.name == "Claude (general)"));
     }
 
     #[test]

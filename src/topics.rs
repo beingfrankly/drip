@@ -41,6 +41,12 @@ fn parse_kind_column(raw: String) -> rusqlite::Result<SourceKind> {
 pub struct TopicWithSources {
     pub id: i64,
     pub name: String,
+    /// `None` for a main topic; `Some(<main topic's name>)` for a sub-topic
+    /// (bd issue drip-ho5.4). Lets a caller render the two-level hierarchy
+    /// (main topics with their sub-topics indented/marked beneath them)
+    /// straight from [`list_topics`]'s single flat `Vec`, without a second
+    /// round-trip to work out which topics are which.
+    pub parent_name: Option<String>,
     pub source_labels: Vec<String>,
 }
 
@@ -103,6 +109,30 @@ pub fn get_or_create_topic(conn: &Connection, name: &str) -> Result<i64> {
     topic_id_by_name(conn, name)
 }
 
+/// **Test-only** (bd issue drip-ho5.4): create a sub-topic named `name`
+/// directly under the main topic `parent_id`, bypassing `create_topic`'s
+/// still-parent-less public signature (`drip topic add --parent` is bd issue
+/// drip-ho5.8's job, not this one's -- that ticket owns the CLI flag, this
+/// one only needs a way to build a two-level tree in tests). `pub` at module
+/// level (mirroring [`get_or_create_topic`]'s and `sources::upsert_reddit_source`'s
+/// own cfg(test) convention) rather than nested inside `mod tests`, so
+/// `src/main.rs`'s `handle_topic` end-to-end tests can reach it too via
+/// `topics::make_sub_topic` without duplicating raw SQL of their own.
+#[cfg(test)]
+pub fn make_sub_topic(conn: &Connection, parent_id: i64, name: &str) -> i64 {
+    conn.execute(
+        "INSERT INTO topics (name, parent_id) VALUES (?1, ?2)",
+        params![name, parent_id],
+    )
+    .expect("insert sub-topic should succeed");
+    conn.query_row(
+        "SELECT id FROM topics WHERE name = ?1",
+        params![name],
+        |row| row.get(0),
+    )
+    .expect("sub-topic lookup should succeed")
+}
+
 /// Look up a topic's id by its name, returning a clear error (pointing at
 /// `drip topic list`) if no topic has that name.
 fn topic_id_by_name(conn: &Connection, topic_name: &str) -> Result<i64> {
@@ -143,18 +173,43 @@ pub fn require_topic_id(conn: &Connection, name: &str) -> Result<i64> {
     }
 }
 
-/// Count how many sources currently belong to the topic named `topic_name`
-/// (bd issue drip-38w.2: backs `drip topic remove`'s "refuse while non-empty"
-/// guard). Errors clearly if no topic has that name, via [`topic_id_by_name`]
+/// Count how many sub-topics are directly parented under the topic named
+/// `topic_name` (bd issue drip-ho5.4, per drip-98u.7's resolution: backs
+/// `drip topic remove`'s "a main topic refuses removal while it has
+/// sub-topics" guard). Zero for a childless main topic and always zero for a
+/// sub-topic (two-level depth cap -- a sub-topic never has children of its
+/// own). Errors clearly if no topic has that name, via [`topic_id_by_name`]
 /// -- this is a read, so an unknown name is pointed at `drip topic list`
 /// rather than `drip topic add`.
 ///
-/// Reads via `topic_links` (bd issue drip-ho5.3), not the now-dead
-/// `sources.topic_id` column -- see `src/sources.rs`'s `find_by_label`/`list`
-/// doc comments for why that column no longer carries membership. MINIMAL
-/// fix to keep this guard functioning; slice 2 (drip-ho5.3) reworks this
-/// module's shape for the two-level topic tree properly.
-pub fn topic_source_count(conn: &Connection, topic_name: &str) -> Result<i64> {
+/// Replaces the old one-topic-per-source-era `topic_source_count` (bd issue
+/// drip-38w.2), which no longer expressed a coherent meaning once membership
+/// became many-to-many via `topic_links` (bd issue drip-ho5.3's minimal
+/// patch just repointed its query at that table without addressing this).
+/// Paired with [`topic_link_count`] below -- see `src/main.rs`'s
+/// `handle_topic`'s `Remove` branch for how the two guards combine.
+pub fn topic_child_count(conn: &Connection, topic_name: &str) -> Result<i64> {
+    let topic_id = topic_id_by_name(conn, topic_name)?;
+
+    conn.query_row(
+        "SELECT COUNT(*) FROM topics WHERE parent_id = ?1",
+        params![topic_id],
+        |row| row.get(0),
+    )
+    .with_context(|| format!("failed to count sub-topics for topic '{topic_name}'"))
+}
+
+/// Count how many sources are directly linked (via `topic_links`) to the
+/// topic named `topic_name` -- NOT expanded to descendants, unlike
+/// [`sources_for_topic`] (bd issue drip-ho5.4, per drip-98u.7's resolution:
+/// backs `drip topic remove`'s "a sub-topic refuses removal while it has
+/// source links" guard). Also protects a legacy topic created before
+/// hierarchy existed (bd issue drip-ho5.8's `topic add --parent`) that still
+/// has a direct link from being silently removed out from under its source,
+/// since such a topic has zero children and would otherwise sail past
+/// [`topic_child_count`]'s guard. Errors clearly if no topic has that name,
+/// via [`topic_id_by_name`].
+pub fn topic_link_count(conn: &Connection, topic_name: &str) -> Result<i64> {
     let topic_id = topic_id_by_name(conn, topic_name)?;
 
     conn.query_row(
@@ -194,8 +249,24 @@ pub fn move_source_to_topic(conn: &Connection, topic_name: &str, source_label: &
     sources::set_source_topic(conn, source_label, topic_id)
 }
 
-/// List every topic, ordered by name, with the labels of its member
-/// sources (also ordered, by label) for `drip topic list` to render.
+/// List every topic, grouped into the two-level tree (bd issue drip-ho5.4,
+/// per drip-98u.7's resolution), with the labels of its own directly-linked
+/// member sources (ordered by label) for `drip topic list` to render.
+///
+/// Rendering choice: rather than a nested `Vec<Vec<_>>` (main topics each
+/// owning a `Vec` of sub-topics), this returns one flat `Vec` ordered so
+/// each main topic is immediately followed by its own sub-topics
+/// (alphabetically among themselves), with `parent_name` on each row saying
+/// which group it belongs to (`None` for a main topic). A caller renders the
+/// tree by indenting/marking any row with `parent_name.is_some()`, without
+/// needing a second data shape -- and every existing flat consumer (this
+/// module's own tests' `find_topic` helper, `handle_topic`'s `List` branch)
+/// keeps working against a plain `Vec` unchanged. A source linked into two
+/// different sub-topics appears under each of them (its own row's
+/// `source_labels`), never collapsed -- that's what "member sources" means
+/// for each individual sub-topic under many-to-many `topic_links`, distinct
+/// from [`sources_for_topic`]'s deliberate cross-sub-topic dedup for a
+/// *main* topic's fetch expansion.
 ///
 /// Membership is read via `topic_links` (bd issue drip-ho5.3), not the
 /// now-dead `sources.topic_id` column (previously bd issue drip-38w.1) or
@@ -204,16 +275,23 @@ pub fn move_source_to_topic(conn: &Connection, topic_name: &str, source_label: &
 /// through `sources::upsert_source`/`set_source_topic`, both of which are
 /// only ever called with an already-labeled source in this codebase -- but
 /// defensively) are excluded from `source_labels`, matching `sources::list`'s
-/// own `display_name IS NOT NULL` convention. MINIMAL fix to keep this
-/// functioning; slice 2 (drip-ho5.3) reworks this module's shape for the
-/// two-level topic tree properly.
+/// own `display_name IS NOT NULL` convention.
 pub fn list_topics(conn: &Connection) -> Result<Vec<TopicWithSources>> {
+    // Ordering: group by each row's main-topic name (a main topic's own
+    // group key is its own name, via `COALESCE`), main topic first within
+    // its group (`parent_id IS NULL` sorts true-before-false under `DESC`,
+    // since SQLite represents booleans as 1/0), then its sub-topics
+    // alphabetically.
     let mut topic_stmt = conn
-        .prepare("SELECT id, name FROM topics ORDER BY name")
+        .prepare(
+            "SELECT t.id, t.name, p.name \
+             FROM topics t LEFT JOIN topics p ON p.id = t.parent_id \
+             ORDER BY COALESCE(p.name, t.name), (t.parent_id IS NULL) DESC, t.name",
+        )
         .context("failed to prepare topic list query")?;
 
-    let topics: Vec<(i64, String)> = topic_stmt
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+    let topics: Vec<(i64, String, Option<String>)> = topic_stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
         .collect::<rusqlite::Result<Vec<_>>>()
         .context("failed to list topics")?;
 
@@ -227,7 +305,7 @@ pub fn list_topics(conn: &Connection) -> Result<Vec<TopicWithSources>> {
         .context("failed to prepare topic source labels query")?;
 
     let mut result = Vec::with_capacity(topics.len());
-    for (id, name) in topics {
+    for (id, name, parent_name) in topics {
         let source_labels = sources_stmt
             .query_map(params![id], |row| row.get::<_, String>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()
@@ -235,6 +313,7 @@ pub fn list_topics(conn: &Connection) -> Result<Vec<TopicWithSources>> {
         result.push(TopicWithSources {
             id,
             name,
+            parent_name,
             source_labels,
         });
     }
@@ -244,16 +323,21 @@ pub fn list_topics(conn: &Connection) -> Result<Vec<TopicWithSources>> {
 
 /// Delete the topic named `name`.
 ///
-/// With the `sources.topic_id` FK's `ON DELETE RESTRICT` (migration 0005,
-/// bd issue drip-38w.1), deleting a topic that still owns any sources fails
-/// at the DB layer -- there is no longer a "cascade to `topic_sources`,
-/// leave `sources` alone" outcome, because `topic_sources` is inert and
-/// membership lives on `sources.topic_id` itself. This function itself does
-/// NOT pre-check emptiness -- `src/main.rs`'s `handle_topic` does that ahead
-/// of calling this, via [`topic_source_count`], so it can refuse with a
-/// clear, actionable message before ever reaching this raw DB-level `DELETE`
-/// (bd issue drip-38w.2). Returns `true` if an (empty) topic existed and was
-/// removed, `false` if no topic had that name.
+/// Two `ON DELETE RESTRICT` FKs (migration 0006, bd issue drip-98u.10) can
+/// make this raw `DELETE` fail at the DB layer: `topics.parent_id` blocks
+/// deleting a main topic while it still has sub-topics, and
+/// `topic_links.topic_id` blocks deleting any topic (main or sub) while it
+/// still has a direct source link. (`sources.topic_id`'s own `ON DELETE
+/// RESTRICT`, migration 0005, is now moot for this path -- migration 0006
+/// nulls that column on every row and nothing repopulates it, so it can
+/// never again be the thing blocking a delete.) This function itself does
+/// NOT pre-check either condition -- `src/main.rs`'s `handle_topic` does
+/// that ahead of calling this, via [`topic_child_count`] and
+/// [`topic_link_count`], so it can refuse with a clear, actionable message
+/// before ever reaching this raw DB-level `DELETE` and surfacing a raw
+/// SQLite FK error instead (bd issue drip-ho5.4, per drip-98u.7's
+/// resolution). Returns `true` if an (empty) topic existed and was removed,
+/// `false` if no topic had that name.
 pub fn remove_topic(conn: &Connection, name: &str) -> Result<bool> {
     let changed = conn
         .execute("DELETE FROM topics WHERE name = ?1", params![name])
@@ -265,19 +349,29 @@ pub fn remove_topic(conn: &Connection, name: &str) -> Result<bool> {
 /// for `drip fetch --topic` (bd issue drip-p6v.7) to expand into fetchable
 /// sources. Errors clearly if the topic name doesn't exist.
 ///
-/// Reads membership via `topic_links` (bd issue drip-ho5.3), not the
-/// now-dead `sources.topic_id` column (previously bd issue drip-38w.1) or
-/// the even-older-inert `topic_sources` join. MINIMAL fix to keep `drip
-/// fetch --topic` functioning; slice 2 (drip-ho5.3) reworks this module's
-/// shape for the two-level topic tree properly.
+/// Per drip-98u.7's resolution: naming a **main** topic expands to every
+/// source linked into any of its sub-topics (a main owns no sources
+/// directly under the intended leaf-only-attachment model, so this is what
+/// makes `--topic <main>` fetch anything at all); naming a **sub-topic**
+/// returns only its own directly-linked sources. The query below handles
+/// both in one shot without needing to know which kind `topic_name` is: it
+/// matches links whose `topic_id` is either `topic_name`'s own id (the
+/// sub-topic case, and the legacy case of a pre-hierarchy topic that still
+/// has a direct link -- e.g. topics created before bd issue drip-ho5.8 adds
+/// `topic add --parent`) OR one of its children's ids (the main-topic
+/// expansion case; empty for a sub-topic, since two-level depth means a
+/// sub-topic has no children of its own). `DISTINCT` collapses a source
+/// linked into two sub-topics under the same main down to one row, per
+/// drip-98u.7's "results deduplicated" requirement (bd issue drip-ho5.4).
 pub fn sources_for_topic(conn: &Connection, topic_name: &str) -> Result<Vec<SourceRow>> {
     let topic_id = topic_id_by_name(conn, topic_name)?;
 
     let mut stmt = conn
         .prepare(
-            "SELECT s.id, s.kind, s.identifier, s.display_name \
+            "SELECT DISTINCT s.id, s.kind, s.identifier, s.display_name \
              FROM sources s JOIN topic_links tl ON tl.source_id = s.id \
              WHERE tl.topic_id = ?1 \
+                OR tl.topic_id IN (SELECT id FROM topics WHERE parent_id = ?1) \
              ORDER BY s.display_name",
         )
         .context("failed to prepare topic member sources query")?;
@@ -459,44 +553,109 @@ mod tests {
         assert_eq!(listed_source.topics, vec!["rust".to_string()]);
     }
 
+    // -- Cycle B (bd issue drip-ho5.4): `topic_source_count` replaced by a
+    // child-count (backs "a main topic refuses removal while it has
+    // sub-topics") and a link-count (backs "a sub-topic refuses removal
+    // while it has source links"), per drip-98u.7's resolution.
+
     #[test]
-    fn topic_source_count_reflects_current_membership() {
+    fn topic_link_count_reflects_current_direct_membership() {
         let (_dir, conn) = fresh_conn();
 
         let tid_rust = create_topic(&conn, "rust").expect("create_topic should succeed");
         create_topic(&conn, "other").expect("create_topic should succeed");
         assert_eq!(
-            topic_source_count(&conn, "rust").expect("topic_source_count should succeed"),
+            topic_link_count(&conn, "rust").expect("topic_link_count should succeed"),
             0
         );
 
         make_source(&conn, tid_rust, "rust-blog");
         assert_eq!(
-            topic_source_count(&conn, "rust").expect("topic_source_count should succeed"),
+            topic_link_count(&conn, "rust").expect("topic_link_count should succeed"),
             1
         );
         assert_eq!(
-            topic_source_count(&conn, "other").expect("topic_source_count should succeed"),
+            topic_link_count(&conn, "other").expect("topic_link_count should succeed"),
             0
         );
 
         move_source_to_topic(&conn, "other", "rust-blog").expect("move should succeed");
         assert_eq!(
-            topic_source_count(&conn, "rust").expect("topic_source_count should succeed"),
+            topic_link_count(&conn, "rust").expect("topic_link_count should succeed"),
             0
         );
         assert_eq!(
-            topic_source_count(&conn, "other").expect("topic_source_count should succeed"),
+            topic_link_count(&conn, "other").expect("topic_link_count should succeed"),
             1
         );
     }
 
     #[test]
-    fn topic_source_count_errors_clearly_when_topic_missing() {
+    fn topic_link_count_errors_clearly_when_topic_missing() {
         let (_dir, conn) = fresh_conn();
 
         let err =
-            topic_source_count(&conn, "does-not-exist").expect_err("missing topic should error");
+            topic_link_count(&conn, "does-not-exist").expect_err("missing topic should error");
+        assert!(err.to_string().contains("does-not-exist"));
+        assert!(err.to_string().contains("drip topic list"));
+    }
+
+    #[test]
+    fn topic_link_count_does_not_expand_to_descendants() {
+        // Unlike `sources_for_topic`, `topic_link_count` deliberately does
+        // NOT expand a main topic into its sub-topics' links -- the removal
+        // guard needs to know whether *this* topic has direct links, not
+        // whether its descendants (if any) do, since the descendant guard
+        // (`topic_child_count`) already fires first for a main with
+        // sub-topics.
+        let (_dir, conn) = fresh_conn();
+
+        let tid_claude = create_topic(&conn, "Claude").expect("create_topic should succeed");
+        let tid_general = make_sub_topic(&conn, tid_claude, "Claude (general)");
+        make_source(&conn, tid_general, "s1");
+
+        assert_eq!(
+            topic_link_count(&conn, "Claude").expect("topic_link_count should succeed"),
+            0,
+            "a main topic's own link count should not include its sub-topics' links"
+        );
+        assert_eq!(
+            topic_link_count(&conn, "Claude (general)").expect("topic_link_count should succeed"),
+            1
+        );
+    }
+
+    #[test]
+    fn topic_child_count_reflects_direct_sub_topics_only() {
+        let (_dir, conn) = fresh_conn();
+
+        let tid_claude = create_topic(&conn, "Claude").expect("create_topic should succeed");
+        assert_eq!(
+            topic_child_count(&conn, "Claude").expect("topic_child_count should succeed"),
+            0,
+            "a childless main topic has zero sub-topics"
+        );
+
+        make_sub_topic(&conn, tid_claude, "Claude (general)");
+        make_sub_topic(&conn, tid_claude, "cc hooks");
+        assert_eq!(
+            topic_child_count(&conn, "Claude").expect("topic_child_count should succeed"),
+            2
+        );
+
+        assert_eq!(
+            topic_child_count(&conn, "Claude (general)").expect("topic_child_count should succeed"),
+            0,
+            "a sub-topic never has children of its own (two-level depth cap)"
+        );
+    }
+
+    #[test]
+    fn topic_child_count_errors_clearly_when_topic_missing() {
+        let (_dir, conn) = fresh_conn();
+
+        let err =
+            topic_child_count(&conn, "does-not-exist").expect_err("missing topic should error");
         assert!(err.to_string().contains("does-not-exist"));
         assert!(err.to_string().contains("drip topic list"));
     }
@@ -520,16 +679,19 @@ mod tests {
 
     #[test]
     fn remove_topic_fails_via_fk_restrict_while_it_still_owns_a_source() {
-        // New invariant under bd issue drip-38w.1's one-topic-per-source
-        // model: `sources.topic_id`'s `ON DELETE RESTRICT` (migration 0005)
-        // means the database itself now refuses to remove a topic that
-        // still owns sources -- there is no more "cascade to
-        // `topic_sources`, but leave the `sources` rows alone" outcome, since
-        // `topic_sources` is inert and membership lives on
-        // `sources.topic_id` directly. `src/main.rs`'s `handle_topic` guards
-        // against this ahead of time (bd issue drip-38w.2) via
-        // `topic_source_count`, but this test still pins today's raw
-        // DB-level behavior: an `Err`, not a panic and not a silent success.
+        // Pins the raw DB-level behavior `remove_topic` relies on
+        // `src/main.rs`'s `handle_topic` to guard ahead of time (bd issue
+        // drip-ho5.4). The actual blocking FK today is `topic_links.topic_id`
+        // `ON DELETE RESTRICT` (migration 0006) -- membership lives in
+        // `topic_links` now, not `sources.topic_id` (that column is nulled
+        // by migration 0006's backfill and never repopulated, so its own
+        // `ON DELETE RESTRICT` from migration 0005 is moot here; this test's
+        // comment used to attribute the failure to that dead column, back
+        // when it was still bd issue drip-38w.1's one-topic-per-source
+        // model). `handle_topic` guards against this via [`topic_link_count`]
+        // (and, for a main topic with sub-topics, [`topic_child_count`]),
+        // but this test still pins today's raw DB-level behavior: an `Err`,
+        // not a panic and not a silent success.
         let (_dir, conn) = fresh_conn();
         let tid_rust = create_topic(&conn, "rust").expect("create_topic should succeed");
         make_source(&conn, tid_rust, "rust-blog");
@@ -603,5 +765,170 @@ mod tests {
             sources_for_topic(&conn, "does-not-exist").expect_err("missing topic should error");
         assert!(err.to_string().contains("does-not-exist"));
         assert!(err.to_string().contains("drip topic list"));
+    }
+
+    // -- Cycle A (bd issue drip-ho5.4): `sources_for_topic` expands a MAIN
+    // topic to all its leaf descendants (drip-98u.7's resolution), while a
+    // sub-topic still returns only its own directly-linked sources.
+
+    #[test]
+    fn sources_for_topic_expands_a_main_topic_to_all_its_sub_topics() {
+        let (_dir, conn) = fresh_conn();
+
+        let tid_claude = create_topic(&conn, "Claude").expect("create_topic should succeed");
+        let tid_general = make_sub_topic(&conn, tid_claude, "Claude (general)");
+        let tid_hooks = make_sub_topic(&conn, tid_claude, "cc hooks");
+
+        make_source(&conn, tid_general, "s1");
+        make_source(&conn, tid_hooks, "s2");
+
+        let members = sources_for_topic(&conn, "Claude")
+            .expect("sources_for_topic on a main topic should succeed");
+        let labels: Vec<String> = members
+            .iter()
+            .map(|s| s.display_name.clone().unwrap())
+            .collect();
+        assert_eq!(
+            labels,
+            vec!["s1".to_string(), "s2".to_string()],
+            "naming the main topic should return sources from every sub-topic beneath it"
+        );
+    }
+
+    #[test]
+    fn sources_for_topic_on_a_sub_topic_returns_only_its_own_directly_linked_sources() {
+        let (_dir, conn) = fresh_conn();
+
+        let tid_claude = create_topic(&conn, "Claude").expect("create_topic should succeed");
+        let tid_general = make_sub_topic(&conn, tid_claude, "Claude (general)");
+        let tid_hooks = make_sub_topic(&conn, tid_claude, "cc hooks");
+
+        make_source(&conn, tid_general, "s1");
+        make_source(&conn, tid_hooks, "s2");
+
+        let members = sources_for_topic(&conn, "Claude (general)")
+            .expect("sources_for_topic on a sub-topic should succeed");
+        assert_eq!(
+            members.len(),
+            1,
+            "naming a sub-topic should return only its own linked sources"
+        );
+        assert_eq!(members[0].display_name, Some("s1".to_string()));
+    }
+
+    #[test]
+    fn sources_for_topic_dedupes_a_source_linked_into_two_sub_topics_under_the_same_main() {
+        let (_dir, conn) = fresh_conn();
+
+        let tid_claude = create_topic(&conn, "Claude").expect("create_topic should succeed");
+        let tid_general = make_sub_topic(&conn, tid_claude, "Claude (general)");
+        let tid_hooks = make_sub_topic(&conn, tid_claude, "cc hooks");
+
+        let s1 = make_source(&conn, tid_general, "s1");
+        // Link the same source into the second sub-topic too, exercising the
+        // many-to-many shape `topic_links` exists for.
+        conn.execute(
+            "INSERT INTO topic_links (source_id, topic_id) VALUES (?1, ?2)",
+            params![s1, tid_hooks],
+        )
+        .expect("second link insert should succeed");
+
+        let members = sources_for_topic(&conn, "Claude")
+            .expect("sources_for_topic on the main topic should succeed");
+        assert_eq!(
+            members.len(),
+            1,
+            "a source linked to two sub-topics under the same main must appear once, not twice"
+        );
+        assert_eq!(members[0].display_name, Some("s1".to_string()));
+    }
+
+    // -- Cycle C (bd issue drip-ho5.4): `list_topics` under many-to-many --
+    // a source linked into two sub-topics must show up under both, and the
+    // returned rows carry enough shape (`parent_name`, grouped ordering) for
+    // `drip topic list` to render the two-level tree rather than a
+    // now-misleading flat list.
+
+    #[test]
+    fn list_topics_shows_a_source_linked_into_two_sub_topics_under_both() {
+        let (_dir, conn) = fresh_conn();
+
+        let tid_claude = create_topic(&conn, "Claude").expect("create_topic should succeed");
+        let tid_general = make_sub_topic(&conn, tid_claude, "Claude (general)");
+        let tid_hooks = make_sub_topic(&conn, tid_claude, "cc hooks");
+
+        let shared_id = make_source(&conn, tid_general, "shared-source");
+        conn.execute(
+            "INSERT INTO topic_links (source_id, topic_id) VALUES (?1, ?2)",
+            params![shared_id, tid_hooks],
+        )
+        .expect("second link insert should succeed");
+
+        let listed = list_topics(&conn).expect("list_topics should succeed");
+
+        assert_eq!(
+            find_topic(&listed, "Claude (general)").source_labels,
+            vec!["shared-source".to_string()],
+            "a source linked into two sub-topics should be listed under the first"
+        );
+        assert_eq!(
+            find_topic(&listed, "cc hooks").source_labels,
+            vec!["shared-source".to_string()],
+            "a source linked into two sub-topics should be listed under the second too"
+        );
+    }
+
+    #[test]
+    fn list_topics_marks_sub_topics_with_their_parent_name() {
+        let (_dir, conn) = fresh_conn();
+
+        let tid_claude = create_topic(&conn, "Claude").expect("create_topic should succeed");
+        create_topic(&conn, "other").expect("create_topic should succeed");
+        make_sub_topic(&conn, tid_claude, "Claude (general)");
+        make_sub_topic(&conn, tid_claude, "cc hooks");
+
+        let listed = list_topics(&conn).expect("list_topics should succeed");
+
+        assert_eq!(
+            find_topic(&listed, "Claude").parent_name,
+            None,
+            "a main topic has no parent"
+        );
+        assert_eq!(
+            find_topic(&listed, "other").parent_name,
+            None,
+            "a childless main topic still has no parent"
+        );
+        assert_eq!(
+            find_topic(&listed, "Claude (general)").parent_name,
+            Some("Claude".to_string())
+        );
+        assert_eq!(
+            find_topic(&listed, "cc hooks").parent_name,
+            Some("Claude".to_string())
+        );
+    }
+
+    #[test]
+    fn list_topics_groups_each_main_topic_with_its_sub_topics_in_order() {
+        let (_dir, conn) = fresh_conn();
+
+        // Deliberately created out of the eventual display order, so this
+        // test can't pass by accident of insertion order.
+        let tid_claude = create_topic(&conn, "Claude").expect("create_topic should succeed");
+        create_topic(&conn, "Another").expect("create_topic should succeed");
+        make_sub_topic(&conn, tid_claude, "cc hooks");
+        make_sub_topic(&conn, tid_claude, "Claude (general)");
+
+        let listed = list_topics(&conn).expect("list_topics should succeed");
+        let names: Vec<&str> = listed.iter().map(|t| t.name.as_str()).collect();
+
+        assert_eq!(
+            names,
+            vec!["Another", "Claude", "Claude (general)", "cc hooks"],
+            "topics should be grouped by main topic (alphabetically), each main followed by \
+             its own sub-topics (also alphabetically) -- not a flat name sort, which would \
+             interleave 'Another' between 'Claude' and its sub-topics"
+        );
     }
 }

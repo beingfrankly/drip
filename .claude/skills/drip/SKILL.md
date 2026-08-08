@@ -55,15 +55,21 @@ Removes a saved source by label.
 
 ### `drip topic add|list|remove`
 
-Topics are named groups of saved sources, so a recurring set of labels can be fetched as one unit instead of typing every member label on every `drip fetch --source ...`. **A source belongs to exactly one topic at a time** — assign it at `drip source add --topic` time, or reassign it with `drip source move --topic`. There is no many-to-many membership; `drip topic` itself only manages topics (create/list/remove), not source membership.
+Topics are named groups of saved sources, so a recurring set of labels can be fetched as one unit instead of typing every member label on every `drip fetch --source ...`. `drip source add --topic`/`drip source move --topic` are still the only CLI verbs that assign a source's topic (`drip topic add --parent`/`drip source link`/`unlink` are not shipped yet — bd issue drip-ho5.8) — but the underlying schema is now a **two-level tree** (main topic → sub-topic; bd issue drip-ho5, migration `0006_topic_tree.sql`), not a flat namespace: every topic that existed before that migration automatically gained a `<name> (general)` sub-topic, and that's where its sources actually live now. `--topic <main>` on `drip fetch` still resolves to the same sources as before (it expands to every sub-topic beneath the main).
 
-- `drip topic add --name <name>` — create a new (empty) topic. Errors clearly if the name is already taken.
-- `drip topic remove --name <name>` — delete a topic. **Refuses if the topic still owns any sources**, with:
-  ```
-  topic '<name>' still has N source(s); move them to another topic first (e.g. `drip source move --name <label> --topic <other>`) before removing it
-  ```
+- `drip topic add --name <name>` — create a new (main) topic. Errors clearly if the name is already taken.
+- `drip topic remove --name <name>` — delete a topic. **Refuses while it has any descendant**:
+  - a topic that still has sub-topics:
+    ```
+    topic '<name>' still has N sub-topic(s); remove them first
+    ```
+  - a topic (main or sub) that still has directly-linked sources:
+    ```
+    topic '<name>' still has N source(s); move them to another topic first (e.g. `drip source move --name <label> --topic <other>`) before removing it
+    ```
+
   Removing an empty topic still works. Removing an unknown topic name is still benign (prints `no topic named '<name>'`, not an error).
-- `drip topic list` — list every saved topic with its member sources' labels.
+- `drip topic list` — lists every saved topic as a two-level tree: each main topic, followed immediately by its own sub-topics (indented two spaces), each with its directly-linked sources' labels.
 
 ### `drip fetch --source <label>[,<label>...] --topic <name>[,<name>...] --all [flags]`
 
