@@ -1,3 +1,4 @@
+mod classify;
 mod cli;
 mod config;
 mod cron;
