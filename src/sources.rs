@@ -19,18 +19,28 @@ use crate::types::SourceKind;
 
 /// A single `sources` row, as returned by the labeled-source lookups below.
 ///
-/// `topic_id`/`topic_name` are always populated (bd issue drip-38w.1: every
-/// source belongs to EXACTLY ONE topic, tracked by `sources.topic_id`) --
-/// `find_by_label`/`list` join against `topics` to fetch them rather than
-/// leaving them optional.
+/// Deliberately carries NO topic information (bd issue drip-ho5.3, decided
+/// 2026-08-07): a source describes a feed, not its memberships, and the
+/// one-topic-per-source assumption `topic_id`/`topic_name` used to encode is
+/// no longer representable now that a source can link into more than one
+/// sub-topic (`migrations/0006_topic_tree.sql`'s `topic_links` table). Code
+/// that needs a source's linked sub-topics reaches for [`SourceWithTopics`]
+/// (via [`list_with_topics`]) instead.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SourceRow {
     pub id: i64,
     pub kind: SourceKind,
     pub identifier: String,
     pub display_name: Option<String>,
-    pub topic_id: i64,
-    pub topic_name: String,
+}
+
+/// A labeled source together with the names of every sub-topic it's linked
+/// into (via `topic_links`), sorted -- backs `drip source list`. Mirrors the
+/// existing `TopicWithSources` precedent (`src/topics.rs`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SourceWithTopics {
+    pub source: SourceRow,
+    pub topics: Vec<String>,
 }
 
 /// Parse a `sources.kind` TEXT column value (already read out as a
@@ -64,15 +74,15 @@ fn parse_kind_column(raw: String) -> rusqlite::Result<SourceKind> {
 /// `upsert_reddit_source` below) must never clobber a label a `drip source
 /// add` call gave this row.
 ///
-/// `topic_id` is the row's owning topic (bd issue drip-38w.1: every source
-/// belongs to EXACTLY ONE topic). On a fresh insert it's always set. On the
-/// `Some(label)` conflict branch (re-adding an already-labeled source) it is
-/// ALSO updated, on the theory that re-running `drip source add` for an
-/// existing label is a deliberate re-assignment, not just a label refresh; on
-/// the `None`-label branch (`ON CONFLICT DO NOTHING`) it's only used for a
-/// genuinely fresh row, matching that branch's existing idempotency -- an
-/// unlabeled re-upsert (e.g. `upsert_reddit_source`) never touches an
-/// existing row's topic.
+/// `topic_id` is the topic this source is linked into (bd issue drip-ho5.3):
+/// rather than writing `sources.topic_id` (now dead -- migration 0006 nulls
+/// it, and nothing repopulates it going forward), this creates a row in
+/// `topic_links` instead, the many-to-many table that replaces it as the
+/// source-of-truth for topic membership. `topic_links` has `UNIQUE
+/// (source_id, topic_id)`, so re-adding an already-linked `(kind,
+/// identifier)` into the SAME topic is a no-op rather than a duplicate link
+/// -- this keeps `upsert_source` idempotent end-to-end, matching its
+/// existing idempotent-upsert behaviour for the `sources` row itself.
 ///
 /// If `display_name` is `Some(x)` and `x` is already claimed by a DIFFERENT
 /// `(kind, identifier)` pair, the `idx_sources_display_name` unique index
@@ -89,16 +99,16 @@ pub fn upsert_source(
     let kind = kind.as_str();
     let result = match display_name {
         Some(label) => conn.execute(
-            "INSERT INTO sources (kind, identifier, display_name, topic_id) \
-             VALUES (?1, ?2, ?3, ?4) \
+            "INSERT INTO sources (kind, identifier, display_name) \
+             VALUES (?1, ?2, ?3) \
              ON CONFLICT(kind, identifier) DO UPDATE SET \
-                display_name = excluded.display_name, topic_id = excluded.topic_id",
-            params![kind, identifier, label, topic_id],
+                display_name = excluded.display_name",
+            params![kind, identifier, label],
         ),
         None => conn.execute(
-            "INSERT INTO sources (kind, identifier, topic_id) VALUES (?1, ?2, ?3) \
+            "INSERT INTO sources (kind, identifier) VALUES (?1, ?2) \
              ON CONFLICT(kind, identifier) DO NOTHING",
-            params![kind, identifier, topic_id],
+            params![kind, identifier],
         ),
     };
 
@@ -111,6 +121,13 @@ pub fn upsert_source(
             |row| row.get(0),
         )
         .with_context(|| format!("failed to look up source id for {kind} '{identifier}'"))?;
+
+    conn.execute(
+        "INSERT INTO topic_links (source_id, topic_id) VALUES (?1, ?2) \
+         ON CONFLICT(source_id, topic_id) DO NOTHING",
+        params![id, topic_id],
+    )
+    .with_context(|| format!("failed to link source '{identifier}' to topic {topic_id}"))?;
 
     Ok(id)
 }
@@ -159,11 +176,17 @@ pub fn upsert_reddit_source(conn: &Connection, subreddit: &str) -> Result<i64> {
 
 /// Look up a labeled source by its `display_name`. Returns `None` if no
 /// source has that label.
+///
+/// Reads `sources` alone -- no join against `topics`/`topic_links` (bd issue
+/// drip-ho5.3). The previous `INNER JOIN topics ON t.id = s.topic_id`
+/// silently returned no rows for any source once `sources.topic_id` was
+/// NULL, which migration 0006 makes true of every source (existing rows via
+/// its backfill, new rows because `upsert_source` no longer writes that
+/// column at all). A source's topic membership is looked up separately, via
+/// [`list_with_topics`], when a caller actually needs it.
 pub fn find_by_label(conn: &Connection, label: &str) -> Result<Option<SourceRow>> {
     let row = conn.query_row(
-        "SELECT s.id, s.kind, s.identifier, s.display_name, s.topic_id, t.name \
-         FROM sources s JOIN topics t ON t.id = s.topic_id \
-         WHERE s.display_name = ?1",
+        "SELECT id, kind, identifier, display_name FROM sources WHERE display_name = ?1",
         params![label],
         |row| {
             Ok(SourceRow {
@@ -171,8 +194,6 @@ pub fn find_by_label(conn: &Connection, label: &str) -> Result<Option<SourceRow>
                 kind: parse_kind_column(row.get(1)?)?,
                 identifier: row.get(2)?,
                 display_name: row.get(3)?,
-                topic_id: row.get(4)?,
-                topic_name: row.get(5)?,
             })
         },
     );
@@ -189,12 +210,14 @@ pub fn find_by_label(conn: &Connection, label: &str) -> Result<Option<SourceRow>
 /// Reddit sources created implicitly via the now-removed `-s`/`drip profile
 /// add` (bd issue drip-1uk.1/.2); `drip source list` is specifically for the
 /// sources this module's labeled-CRUD functions manage.
+///
+/// No join against `topics`/`topic_links` -- see [`find_by_label`]'s doc
+/// comment for why (bd issue drip-ho5.3).
 pub fn list(conn: &Connection) -> Result<Vec<SourceRow>> {
     let mut stmt = conn
         .prepare(
-            "SELECT s.id, s.kind, s.identifier, s.display_name, s.topic_id, t.name \
-             FROM sources s JOIN topics t ON t.id = s.topic_id \
-             WHERE s.display_name IS NOT NULL ORDER BY s.display_name",
+            "SELECT id, kind, identifier, display_name FROM sources \
+             WHERE display_name IS NOT NULL ORDER BY display_name",
         )
         .context("failed to prepare source list query")?;
 
@@ -204,13 +227,51 @@ pub fn list(conn: &Connection) -> Result<Vec<SourceRow>> {
             kind: parse_kind_column(row.get(1)?)?,
             identifier: row.get(2)?,
             display_name: row.get(3)?,
-            topic_id: row.get(4)?,
-            topic_name: row.get(5)?,
         })
     })?;
 
     rows.collect::<rusqlite::Result<Vec<_>>>()
         .context("failed to list sources")
+}
+
+/// The names of every sub-topic `source_id` is linked into (via
+/// `topic_links`), sorted. Building block for [`list_with_topics`]; also
+/// used directly by `src/main.rs`'s per-source fetch path (bd issue
+/// drip-ho5.3) to derive a `SourceGroup`'s digest-heading topic now that
+/// `SourceRow` itself no longer carries one -- see that call site's own
+/// comment (points at bd issue drip-98u.5 for the eventual replacement).
+pub fn topic_names_for_source(conn: &Connection, source_id: i64) -> Result<Vec<String>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT t.name FROM topic_links tl JOIN topics t ON t.id = tl.topic_id \
+             WHERE tl.source_id = ?1 ORDER BY t.name",
+        )
+        .context("failed to prepare source topic-links query")?;
+
+    let names = stmt
+        .query_map(params![source_id], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .with_context(|| format!("failed to list linked topics for source id {source_id}"))?;
+
+    Ok(names)
+}
+
+/// [`list`] every labeled source, each paired with the names of every
+/// sub-topic it's linked into (via [`topic_names_for_source`]), sorted --
+/// backs `drip source list` (bd issue drip-ho5.3). Mirrors `src/topics.rs`'s
+/// `list_topics` precedent: one query for the parent rows, one query per row
+/// for the child rows, rather than a single join (which would need
+/// row-collapsing logic for a source linked into more than one sub-topic).
+pub fn list_with_topics(conn: &Connection) -> Result<Vec<SourceWithTopics>> {
+    let sources = list(conn)?;
+
+    let mut result = Vec::with_capacity(sources.len());
+    for source in sources {
+        let topics = topic_names_for_source(conn, source.id)?;
+        result.push(SourceWithTopics { source, topics });
+    }
+
+    Ok(result)
 }
 
 /// Delete the source row whose `display_name` is `label`. Returns `true` if
@@ -226,27 +287,34 @@ pub fn remove_by_label(conn: &Connection, label: &str) -> Result<bool> {
 }
 
 /// Assign/move the source labeled `source_label` to the topic `topic_id`
-/// (bd issue drip-38w.1). This is the single place `sources.topic_id` is
-/// ever updated after a source's initial insert -- both `drip topic
-/// add-source` (reassign) and `drip topic remove-source` (fall back to
-/// "Uncategorized") go through this, via `crate::topics`'s repointed
-/// wrappers.
+/// (bd issue drip-38w.1, repointed by bd issue drip-ho5.3). No longer writes
+/// the dead `sources.topic_id` column -- instead replaces the source's
+/// `topic_links` rows with a single link to `topic_id`, the closest
+/// equivalent of "move" under the new many-to-many shape. This is the single
+/// place a source's topic membership is ever reassigned wholesale after its
+/// initial insert -- `crate::topics::move_source_to_topic` (backing `drip
+/// source move`) is its sole caller.
 ///
 /// Errors clearly if no source has `source_label` -- mirrors
 /// `crate::topics::source_by_label`'s "no source named ... (run `drip source
 /// list`)" message, since callers here are typically already holding a topic
 /// name and need the same clarity bar for an unknown source label.
 pub fn set_source_topic(conn: &Connection, source_label: &str, topic_id: i64) -> Result<()> {
-    let changed = conn
-        .execute(
-            "UPDATE sources SET topic_id = ?2 WHERE display_name = ?1",
-            params![source_label, topic_id],
-        )
-        .with_context(|| format!("failed to set topic for source '{source_label}'"))?;
+    let source = find_by_label(conn, source_label)?.ok_or_else(|| {
+        anyhow::anyhow!("no source named '{source_label}' (run `drip source list`)")
+    })?;
 
-    if changed == 0 {
-        anyhow::bail!("no source named '{source_label}' (run `drip source list`)");
-    }
+    conn.execute(
+        "DELETE FROM topic_links WHERE source_id = ?1",
+        params![source.id],
+    )
+    .with_context(|| format!("failed to clear existing topic links for source '{source_label}'"))?;
+
+    conn.execute(
+        "INSERT INTO topic_links (source_id, topic_id) VALUES (?1, ?2)",
+        params![source.id, topic_id],
+    )
+    .with_context(|| format!("failed to set topic for source '{source_label}'"))?;
 
     Ok(())
 }
@@ -307,8 +375,12 @@ mod tests {
         assert_eq!(found.kind, SourceKind::Rss);
         assert_eq!(found.identifier, "https://example.com/feed.xml");
         assert_eq!(found.display_name, Some("rust-blog".to_string()));
-        assert_eq!(found.topic_id, tid);
-        assert_eq!(found.topic_name, "Uncategorized");
+
+        // `SourceRow` itself no longer carries topic membership (bd issue
+        // drip-ho5.3) -- `list_with_topics` is where that lives now.
+        let listed = list_with_topics(&conn).expect("list_with_topics should succeed");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].topics, vec!["Uncategorized".to_string()]);
     }
 
     #[test]
@@ -487,8 +559,84 @@ mod tests {
         let found = find_by_label(&conn, "rust-blog")
             .unwrap()
             .expect("source should still exist");
-        assert_eq!(found.topic_id, tid_b);
-        assert_eq!(found.topic_name, "b");
+
+        // `SourceRow` no longer carries topic membership (bd issue
+        // drip-ho5.3) -- assert the `topic_links` row directly: the source
+        // should be linked ONLY to the new topic, its old link replaced
+        // rather than left alongside it.
+        let listed = list_with_topics(&conn).expect("list_with_topics should succeed");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].source.id, found.id);
+        assert_eq!(listed[0].topics, vec!["b".to_string()]);
+    }
+
+    #[test]
+    fn find_by_label_and_list_find_sources_even_when_topic_id_is_null() {
+        // Migration 0006 nulls every `sources.topic_id` (bd issue drip-ho5.3
+        // -- see the migration's own header comment and bd-ho5.3's bug
+        // inventory). `find_by_label`/`list`'s old `INNER JOIN topics ON
+        // t.id = s.topic_id` silently excluded a source the moment that
+        // column went NULL. Apply the FULL migration chain via `db::open`
+        // (so the schema is exactly what a real post-0006 database has),
+        // seed a source directly with a NULL `topic_id` -- the exact
+        // post-migration shape -- and assert both lookups still find it.
+        let (_dir, conn) = fresh_conn();
+
+        conn.execute(
+            "INSERT INTO sources (kind, identifier, display_name) VALUES ('rss', \
+             'https://example.com/feed.xml', 'rust-blog')",
+            [],
+        )
+        .expect("raw insert with NULL topic_id should succeed");
+
+        let found = find_by_label(&conn, "rust-blog")
+            .expect("find_by_label should succeed")
+            .expect("a source with a NULL topic_id should still be found");
+        assert_eq!(found.display_name, Some("rust-blog".to_string()));
+        assert_eq!(found.identifier, "https://example.com/feed.xml");
+
+        let listed = list(&conn).expect("list should succeed");
+        assert_eq!(
+            listed.len(),
+            1,
+            "list() should also find the source despite its NULL topic_id"
+        );
+    }
+
+    #[test]
+    fn list_with_topics_returns_every_linked_sub_topic_sorted() {
+        let (_dir, conn) = fresh_conn();
+        let tid_zeta = crate::topics::get_or_create_topic(&conn, "zeta").unwrap();
+        let tid_alpha = crate::topics::get_or_create_topic(&conn, "alpha").unwrap();
+
+        let id = upsert_source(
+            &conn,
+            SourceKind::Rss,
+            "https://example.com/feed.xml",
+            Some("rust-blog"),
+            tid_zeta,
+        )
+        .expect("upsert should succeed");
+
+        // Link the same source into a SECOND sub-topic directly -- exercises
+        // the many-to-many shape `topic_links` exists for (a source with two
+        // sub-topics), even though `upsert_source`'s own signature still
+        // only takes one `topic_id` at a time in this slice.
+        conn.execute(
+            "INSERT INTO topic_links (source_id, topic_id) VALUES (?1, ?2)",
+            params![id, tid_alpha],
+        )
+        .expect("second link insert should succeed");
+
+        let listed = list_with_topics(&conn).expect("list_with_topics should succeed");
+
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].source.display_name, Some("rust-blog".to_string()));
+        assert_eq!(
+            listed[0].topics,
+            vec!["alpha".to_string(), "zeta".to_string()],
+            "linked sub-topics should be returned sorted by name"
+        );
     }
 
     #[test]

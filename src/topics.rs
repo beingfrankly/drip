@@ -148,11 +148,17 @@ pub fn require_topic_id(conn: &Connection, name: &str) -> Result<i64> {
 /// guard). Errors clearly if no topic has that name, via [`topic_id_by_name`]
 /// -- this is a read, so an unknown name is pointed at `drip topic list`
 /// rather than `drip topic add`.
+///
+/// Reads via `topic_links` (bd issue drip-ho5.3), not the now-dead
+/// `sources.topic_id` column -- see `src/sources.rs`'s `find_by_label`/`list`
+/// doc comments for why that column no longer carries membership. MINIMAL
+/// fix to keep this guard functioning; slice 2 (drip-ho5.3) reworks this
+/// module's shape for the two-level topic tree properly.
 pub fn topic_source_count(conn: &Connection, topic_name: &str) -> Result<i64> {
     let topic_id = topic_id_by_name(conn, topic_name)?;
 
     conn.query_row(
-        "SELECT COUNT(*) FROM sources WHERE topic_id = ?1",
+        "SELECT COUNT(*) FROM topic_links WHERE topic_id = ?1",
         params![topic_id],
         |row| row.get(0),
     )
@@ -191,13 +197,16 @@ pub fn move_source_to_topic(conn: &Connection, topic_name: &str, source_label: &
 /// List every topic, ordered by name, with the labels of its member
 /// sources (also ordered, by label) for `drip topic list` to render.
 ///
-/// Membership is read via `sources.topic_id` (bd issue drip-38w.1), not the
-/// now-inert `topic_sources` join. Unlabeled member sources (there shouldn't
-/// be any -- every source that gets a `topic_id` also went through
-/// `sources::upsert_source`/`set_source_topic`, both of which are only ever
-/// called with an already-labeled source in this codebase -- but
+/// Membership is read via `topic_links` (bd issue drip-ho5.3), not the
+/// now-dead `sources.topic_id` column (previously bd issue drip-38w.1) or
+/// the even-older-inert `topic_sources` join. Unlabeled member sources
+/// (there shouldn't be any -- every source that gets linked also went
+/// through `sources::upsert_source`/`set_source_topic`, both of which are
+/// only ever called with an already-labeled source in this codebase -- but
 /// defensively) are excluded from `source_labels`, matching `sources::list`'s
-/// own `display_name IS NOT NULL` convention.
+/// own `display_name IS NOT NULL` convention. MINIMAL fix to keep this
+/// functioning; slice 2 (drip-ho5.3) reworks this module's shape for the
+/// two-level topic tree properly.
 pub fn list_topics(conn: &Connection) -> Result<Vec<TopicWithSources>> {
     let mut topic_stmt = conn
         .prepare("SELECT id, name FROM topics ORDER BY name")
@@ -211,7 +220,8 @@ pub fn list_topics(conn: &Connection) -> Result<Vec<TopicWithSources>> {
     let mut sources_stmt = conn
         .prepare(
             "SELECT s.display_name FROM sources s \
-             WHERE s.topic_id = ?1 AND s.display_name IS NOT NULL \
+             JOIN topic_links tl ON tl.source_id = s.id \
+             WHERE tl.topic_id = ?1 AND s.display_name IS NOT NULL \
              ORDER BY s.display_name",
         )
         .context("failed to prepare topic source labels query")?;
@@ -255,16 +265,19 @@ pub fn remove_topic(conn: &Connection, name: &str) -> Result<bool> {
 /// for `drip fetch --topic` (bd issue drip-p6v.7) to expand into fetchable
 /// sources. Errors clearly if the topic name doesn't exist.
 ///
-/// Reads membership via `sources.topic_id` (bd issue drip-38w.1), not the
-/// now-inert `topic_sources` join.
+/// Reads membership via `topic_links` (bd issue drip-ho5.3), not the
+/// now-dead `sources.topic_id` column (previously bd issue drip-38w.1) or
+/// the even-older-inert `topic_sources` join. MINIMAL fix to keep `drip
+/// fetch --topic` functioning; slice 2 (drip-ho5.3) reworks this module's
+/// shape for the two-level topic tree properly.
 pub fn sources_for_topic(conn: &Connection, topic_name: &str) -> Result<Vec<SourceRow>> {
     let topic_id = topic_id_by_name(conn, topic_name)?;
 
     let mut stmt = conn
         .prepare(
-            "SELECT s.id, s.kind, s.identifier, s.display_name, s.topic_id, t.name \
-             FROM sources s JOIN topics t ON t.id = s.topic_id \
-             WHERE s.topic_id = ?1 \
+            "SELECT s.id, s.kind, s.identifier, s.display_name \
+             FROM sources s JOIN topic_links tl ON tl.source_id = s.id \
+             WHERE tl.topic_id = ?1 \
              ORDER BY s.display_name",
         )
         .context("failed to prepare topic member sources query")?;
@@ -275,8 +288,6 @@ pub fn sources_for_topic(conn: &Connection, topic_name: &str) -> Result<Vec<Sour
             kind: parse_kind_column(row.get(1)?)?,
             identifier: row.get(2)?,
             display_name: row.get(3)?,
-            topic_id: row.get(4)?,
-            topic_name: row.get(5)?,
         })
     })?;
 
@@ -422,7 +433,7 @@ mod tests {
         let (_dir, conn) = fresh_conn();
 
         let tid_home = create_topic(&conn, "home").expect("create_topic should succeed");
-        let tid_rust = create_topic(&conn, "rust").expect("create_topic should succeed");
+        create_topic(&conn, "rust").expect("create_topic should succeed");
         make_source(&conn, tid_home, "rust-blog");
 
         move_source_to_topic(&conn, "rust", "rust-blog").expect("first move should succeed");
@@ -437,7 +448,15 @@ mod tests {
         let found = sources::find_by_label(&conn, "rust-blog")
             .unwrap()
             .expect("source should exist");
-        assert_eq!(found.topic_id, tid_rust);
+
+        // `SourceRow` no longer carries topic membership (bd issue
+        // drip-ho5.3) -- assert via `list_with_topics` instead.
+        let listed = sources::list_with_topics(&conn).expect("list_with_topics should succeed");
+        let listed_source = listed
+            .iter()
+            .find(|s| s.source.id == found.id)
+            .expect("source should be in list_with_topics() output");
+        assert_eq!(listed_source.topics, vec!["rust".to_string()]);
     }
 
     #[test]
@@ -530,7 +549,15 @@ mod tests {
         let still_exists = sources::find_by_label(&conn, "rust-blog")
             .expect("find_by_label should succeed")
             .expect("source should still exist after its (now-empty) topic is removed");
-        assert_eq!(still_exists.topic_name, "other");
+
+        // `SourceRow` no longer carries topic membership (bd issue
+        // drip-ho5.3) -- assert via `list_with_topics` instead.
+        let listed = sources::list_with_topics(&conn).expect("list_with_topics should succeed");
+        let listed_source = listed
+            .iter()
+            .find(|s| s.source.id == still_exists.id)
+            .expect("source should be in list_with_topics() output");
+        assert_eq!(listed_source.topics, vec!["other".to_string()]);
     }
 
     #[test]

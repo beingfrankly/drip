@@ -290,11 +290,24 @@ fn fetch_one_source(
                 println!("{label}: fetched {new} item(s)");
             }
 
+            // `SourceRow` no longer carries a topic (bd issue drip-ho5.3 --
+            // a source can now link into more than one sub-topic, so the
+            // single-topic assumption `SourceGroup.topic` encodes is
+            // unrepresentable on the source itself). Derive it from the
+            // source's linked sub-topic(s) as an interim measure; this whole
+            // field goes away once per-item keyword classification replaces
+            // grouping-by-source's-one-topic (bd issue drip-98u.5).
+            let topic = sources::topic_names_for_source(conn, source_row.id)
+                .unwrap_or_default()
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| "Uncategorized".to_string());
+
             SourceResult::Fetched {
                 group: SourceGroup {
                     kind: source_row.kind,
                     name: label.to_string(),
-                    topic: source_row.topic_name.clone(),
+                    topic,
                 },
                 items: filtered,
                 source_id: source_row.id,
@@ -943,17 +956,23 @@ fn handle_source(action: &SourceAction, config: &Config) -> Result<()> {
             }
         }
         SourceAction::List => {
-            let saved = sources::list(&conn)?;
+            // `SourceRow` no longer carries a topic (bd issue drip-ho5.3 --
+            // a source can now link into more than one sub-topic), so
+            // `list_with_topics` is used here instead of `list` to still
+            // print each source's topic membership. MINIMAL fix to keep
+            // this printing something sensible; slice 2 (drip-ho5.3)
+            // reworks this rendering for the two-level topic tree properly.
+            let saved = sources::list_with_topics(&conn)?;
             if saved.is_empty() {
                 println!("no sources saved yet");
             } else {
                 for row in &saved {
                     println!(
                         "- {} (topic: {}, kind: {}, url: {})",
-                        row.display_name.as_deref().unwrap_or("?"),
-                        row.topic_name,
-                        row.kind.as_str(),
-                        row.identifier
+                        row.source.display_name.as_deref().unwrap_or("?"),
+                        row.topics.join(", "),
+                        row.source.kind.as_str(),
+                        row.source.identifier
                     );
                 }
             }
@@ -1398,7 +1417,11 @@ mod tests {
         let found = sources::find_by_label(&conn, "rust-blog")
             .unwrap()
             .expect("source should exist");
-        assert_eq!(found.topic_name, "rust");
+
+        // `SourceRow` no longer carries topic membership (bd issue
+        // drip-ho5.3) -- assert via `topic_names_for_source` instead.
+        let topics = sources::topic_names_for_source(&conn, found.id).unwrap();
+        assert_eq!(topics, vec!["rust".to_string()]);
     }
 
     #[test]
