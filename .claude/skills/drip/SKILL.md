@@ -13,15 +13,18 @@ description: Use when the user wants to fetch Reddit/RSS/YouTube content into an
 
 Interactive first-run wizard. Sets `vault_path` in `config.toml` and seeds SQLite `settings` (posts folder, daily notes folder, daily note date format, default sort, default limit). Can optionally install a daily cron entry for unattended fetches; re-running and confirming again updates that entry in place rather than duplicating it.
 
-### `drip source add --kind rss|youtube|reddit --url <url> --name <label> --topic <name>`
+### `drip source add --kind rss|youtube|reddit --url <url> --name <label> --topic <sub-topic> [--exclude <term>[,<term>...]]`
 
-Registers a source under a fetchable label. **Every source belongs to exactly one topic** — `--topic` is required, and the named topic must **already exist** (`drip source add` does NOT auto-create it). If it doesn't, this errors:
+Registers a source under a fetchable label and creates exactly one **ruleless** (accept-everything) link into `--topic`. `--topic` is required, must **already exist**, and must be a **leaf sub-topic** — `drip source add` does NOT auto-create it, and rejects a bare main topic:
 
 ```
 no topic named '<name>'; create it first with `drip topic add --name <name>`
+'<name>' is a main topic; sources link to sub-topics only -- create one with `drip topic add --name <sub-topic> --parent <name>`
 ```
 
-So the order is always: `drip topic add --name <name>` first, then `drip source add ... --topic <name>`.
+So the order is always: `drip topic add --name <main>` → `drip topic add --name <sub> --parent <main>` → `drip source add ... --topic <sub>`. Use `drip source link` afterwards to add keyword rules or link the source into further sub-topics.
+
+`--exclude <term>[,<term>...]` sets the source's **title-only** exclude terms — a pre-filter applied before any sub-topic's rules run at all. **Declarative/replacing**: re-running `source add` with a different `--exclude` list replaces it wholesale; omitting the flag clears it.
 
 `--url`'s meaning depends on `--kind`:
 
@@ -37,39 +40,59 @@ Reddit-only flags on `source add` (ignored for other kinds):
 
 These are baked into the feed URL at `source add` time, not at fetch time.
 
-### `drip source move --name <label> --topic <name>`
+### `drip source link --name <label> --topic <sub-topic> [--match <term>[,<term>...]] [--exclude <term>[,<term>...]] [--match-body]`
 
-Reassigns an already-saved source to a different (existing) topic. This is the **only** way to change a source's topic after it's been registered — since a source always belongs to exactly one topic, there's no separate "add to topic"/"remove from topic" operation; you move it instead. The destination topic must already exist (same "create it first with `drip topic add`" error as `source add` if it doesn't). Moving a source to the topic it's already in is a harmless no-op.
+Declaratively (re)configures the link between an already-saved source and a (leaf) sub-topic — creating it if it doesn't exist yet. **`--match`/`--exclude` REPLACE that link's entire include/exclude term lists wholesale**, not append: re-running the exact same command is idempotent and produces identical state, which is what makes a shell script the reproducible way to author a source's rule set. Omitting `--match`/`--exclude` clears that side. `--match-body` also matches an item's body/summary text for this link, not just its title.
+
+`--topic` must already exist and be a leaf sub-topic — linking directly to a main topic is rejected, same error as `source add`. **Never touches `seen_items`**: editing a link's rules is a plain row-level change against `link_rules`, not a remove-and-re-add of the source, so tuning rules never resets that source's dedup ledger.
+
+A source can link into more than one sub-topic at once — each link has its own rules and its own `--match-body` setting.
+
+### `drip source unlink --name <label> --topic <sub-topic>`
+
+Removes the link (and its rules) between a saved source and a sub-topic. A source with no remaining links still exists — it just routes nowhere until linked again. Unlinking a never-linked pair is a harmless no-op.
 
 ### `drip source list`
 
-Lists saved sources, each showing its topic:
+Lists saved sources, each with its source-level excludes (if any) and every sub-topic link it has, with that link's rules:
 
 ```
-- rust-hot (topic: rust, kind: reddit, url: rust)
+- rust-hot (kind: reddit, url: rust)
+    -> releases (Rust): match=1.0,1.1,1.2
+    -> general (Rust): ruleless
 ```
 
 ### `drip source remove --name <label>`
 
-Removes a saved source by label.
+Removes a saved source by label (and cascades its links).
 
-### `drip topic add|list|remove`
+### `drip topic add|rename|reparent|remove|list|test`
 
-Topics are named groups of saved sources, so a recurring set of labels can be fetched as one unit instead of typing every member label on every `drip fetch --source ...`. `drip source add --topic`/`drip source move --topic` are still the only CLI verbs that assign a source's topic (`drip topic add --parent`/`drip source link`/`unlink` are not shipped yet — bd issue drip-ho5.8) — but the underlying schema is now a **two-level tree** (main topic → sub-topic; bd issue drip-ho5, migration `0006_topic_tree.sql`), not a flat namespace: every topic that existed before that migration automatically gained a `<name> (general)` sub-topic, and that's where its sources actually live now. `--topic <main>` on `drip fetch` still resolves to the same sources as before (it expands to every sub-topic beneath the main).
+Topics are a **two-level tree**: main topics and their sub-topics (migration `0006_topic_tree.sql`). Sources link into **leaf sub-topics only**, never a main topic directly, via `drip source add --topic`/`drip source link --topic`; each link carries its own keyword rules that route a fetched item into that sub-topic. `--topic <main>` on `drip fetch` expands to every sub-topic beneath it (a main topic owns no sources directly).
 
-- `drip topic add --name <name>` — create a new (main) topic. Errors clearly if the name is already taken.
+- `drip topic add --name <name> [--parent <main>]` — create a new main topic, or (with `--parent`) a sub-topic under an already-existing main topic. **Exactly two levels are enforced in app code**: naming a sub-topic as `--parent` (i.e. one that itself already has a parent) is rejected. Errors clearly if the name is already taken.
+- `drip topic rename --name <old> --to <new>` — renames a topic. **Future-notes-only**: updates the DB but never rewrites an already-written digest note. If TODAY's digest note already has a section under the old name, this **warns** (the rename still succeeds) rather than rewriting the note, since headings are matched by exact text and a same-day fetch would otherwise add a second, differently-named section alongside the existing one.
+- `drip topic reparent --name <sub-topic> --parent <new-main>` — moves a sub-topic under a different main topic. Same future-notes-only warning as `rename` if today's note already has a section for it under its previous main. Rejects moving a main topic (nothing to reparent) or reparenting under something that isn't itself a main topic.
 - `drip topic remove --name <name>` — delete a topic. **Refuses while it has any descendant**:
-  - a topic that still has sub-topics:
+  - a main topic that still has sub-topics:
     ```
     topic '<name>' still has N sub-topic(s); remove them first
     ```
   - a topic (main or sub) that still has directly-linked sources:
     ```
-    topic '<name>' still has N source(s); move them to another topic first (e.g. `drip source move --name <label> --topic <other>`) before removing it
+    topic '<name>' still has N source(s); unlink them first (e.g. `drip source unlink --name <label> --topic <name>`) before removing it
     ```
 
   Removing an empty topic still works. Removing an unknown topic name is still benign (prints `no topic named '<name>'`, not an error).
 - `drip topic list` — lists every saved topic as a two-level tree: each main topic, followed immediately by its own sub-topics (indented two spaces), each with its directly-linked sources' labels.
+- `drip topic test --title "..."` — **offline, no-network** explain surface: classifies a synthetic item (title only) against every saved source's sub-topic links, printing which links match, which terms fired, and where the item would land, e.g.:
+  ```
+  cc-feed -> cc hooks  MATCH  (hook)
+  would route to: Claude > cc hooks
+  ```
+  Answers "why did nothing land in this sub-topic?" without spending a real fetch — pairs with `-v`'s dropped-item titles (see Gotchas below), which covers "what did my rules miss" against live data.
+
+**Topic name rules** (enforced on `add`/`rename`): `,` `[` `]` `{` `}`, newlines, and other control characters are rejected anywhere in the name; a leading YAML sigil (`&` `*` `!` `%` `@` `` ` `` `#`) is rejected; leading/trailing whitespace is trimmed, and empty-after-trimming is rejected; `/` is reserved (illegal now, kept free for future path addressing). Everything else is legal — `C++`, `Node.js`, `.NET`, `AI & ML` all work. The comma rule matters twice over: the digest note's frontmatter is unquoted YAML (`topics: [...]`), and `--topic` on `drip fetch` uses `value_delimiter = ','`, so a comma in a name would silently split it into two.
 
 ### `drip fetch --source <label>[,<label>...] --topic <name>[,<name>...] --all [flags]`
 
@@ -80,7 +103,7 @@ Flags:
 - `--sort <hot|top|new|rising|controversial>` — labels the digest note's frontmatter/header only. Falls back to the saved `default_sort` setting.
 - `--time <hour|day|week|month|year|all>` — labels the digest note only.
 - `-q`/`--query <term>` — labels the digest note only.
-- `-n`/`--limit <n>` — caps how many items are taken **per source**, before dedup. Falls back to saved `default_limit`.
+- `-n`/`--limit <n>` — caps how many items are **written per source**, applied AFTER dedup and keyword-rule classification, not before (see the Gotchas entry below). Falls back to saved `default_limit`.
 - `--tag <tag>[,<tag>...]` — adds real Obsidian tags to the digest note (repeat flag or comma-separate). Falls back to saved `default_tags`.
 - `--topic <name>[,<name>...]` — each named topic (see `drip topic add`/`drip topic list`) is resolved into its member sources' labels and merged with any `--source` labels given in the same invocation. A source named by both `--source` and a `--topic` it belongs to is still fetched exactly once, not twice. An unknown topic name warns clearly (`no topic named '<name>' (run \`drip topic list\`)`) rather than aborting the whole fetch.
 - `--all` — fetch every saved source (see `drip source list`), regardless of `--source`/`--topic` selection. Merges/dedups with any `--source`/`--topic` also given, so a source selected more than one way is still fetched exactly once. Since a topic is just a named group of already-saved sources, `--all` inherently covers everything any topic references — it does not need to iterate topics separately. With no saved sources at all, prints a clear message to stderr and writes nothing (`drip fetch: --all given but no sources are saved yet (run \`drip source add\` first)`). Useful for a stable unattended cron command that doesn't need to enumerate labels.
@@ -122,32 +145,46 @@ The checkbox items are the point: they're plain Obsidian tasks, surfaced elsewhe
 - **No credentials of any kind are ever needed.** Every source kind (Reddit, RSS, YouTube) is fetched via a plain unauthenticated HTTP GET against a public feed URL — no API key, app registration, or OAuth flow anywhere in this tool.
 - **`--tag` on `fetch` adds real Obsidian tags** to the digest note (not just a label), unlike `--sort`/`--time`/`--query`.
 - **The digest note is one-per-day, named `<YYYY-MM-DD> - Daily digest.md`** (local ISO date, no time, no topic/source label). A second `drip fetch` on the same calendar day **appends/merges** into that day's existing note (bd issue drip-47u): genuinely-new items are inserted under the right `## <main topic>` / `### <sub-topic>` headings, while existing lines — including ticked checkboxes (`- [x]`) and manual edits — are preserved untouched. A re-run with nothing new leaves the note byte-for-byte unchanged. `--dry-run` previews the merge, not a fresh note.
-- **Every source belongs to exactly one topic — there's no multi-assign.** `drip source add` requires `--topic`, and reassigning is `drip source move --name <label> --topic <name>`, not an "add to another topic" operation. `drip topic remove` refuses while it still owns any sources (move them out first); an empty topic can always be removed, and doing so never deletes the sources that were in it.
+- **A source can link into more than one sub-topic at once — links are many-to-many, not exclusive.** `drip source add --topic <sub>` creates one link; `drip source link`/`drip source unlink` add/remove further links (each with its own rules). To "move" a source, `unlink` the old sub-topic and `link` the new one — there's no single wholesale-move command (`drip source move` was removed, bd issue drip-ho5.8). `drip topic remove` refuses while it still has any descendant — a sub-topic while it still has direct source links, a main topic while it still has sub-topics; unlink/remove them first. An empty topic can always be removed, and doing so never deletes the sources that were linked to it.
 - **Reddit fetches are throttled + retried to dodge HTTP 429 (per-IP, global).** `drip fetch` spaces reddit requests `reddit_request_delay_secs` apart (default 10s), widening after each 429 it sees ("pressure"), retries a 429 up to `reddit_retry_max` times (default 4, honoring `Retry-After` then exponential backoff with base `reddit_retry_base_secs`, default 5s), and runs a **final retry pass** over any source still rate-limited after a longer cooldown. Anything still 429 after that is skipped for the run and picked up next run (dedup avoids dupes). RSS/YouTube feeds are never throttled. Tune via `drip config set reddit_request_delay_secs <n>` etc. if you fetch many reddit sources at once.
 
 ## Example workflow
 
 ```bash
-# Create the topic first -- `drip source add` requires it to already exist
+# Create the main topic, then a leaf sub-topic under it -- `drip source add`
+# requires an existing LEAF sub-topic, never a bare main topic
 drip topic add --name rust
+drip topic add --name "rust news" --parent rust
 
-# Register a Reddit source with a real sort/time/search baked in, into that topic
-drip source add --kind reddit --url rust --sort top --time week --search "async" --name rust-async-weekly --topic rust
+# Register a Reddit source with a real sort/time/search baked in, linked into
+# that sub-topic with one ruleless (accept-everything) link
+drip source add --kind reddit --url rust --sort top --time week --search "async" --name rust-async-weekly --topic "rust news"
 
 # Fetch it on its own
 drip fetch --source rust-async-weekly --tag rust --dry-run
 
-# Register an RSS source into the same topic
-drip source add --kind rss --url https://blog.rust-lang.org/feed.xml --name rust-blog --topic rust
+# Register an RSS source into the same sub-topic
+drip source add --kind rss --url https://blog.rust-lang.org/feed.xml --name rust-blog --topic "rust news"
 
 # Fetch both together in one combined digest
 drip fetch --source rust-async-weekly,rust-blog -n 5 --tag rust
 
-# Reassign a source to a different (existing) topic
-drip topic add --name programming
-drip source move --name rust-blog --topic programming
+# Add real keyword rules to a link -- declarative: re-running with a
+# different --match list REPLACES it wholesale, which is what makes this
+# script the reproducible config
+drip topic add --name releases --parent rust
+drip source link --name rust-blog --topic releases --match "1.0,1.1,1.2"
 
-# Fetch the whole topic in one go -- digest filename/header is labeled "rust"
+# Sanity-check a rule offline, no network, before spending a real fetch
+drip topic test --title "Rust 1.80 released"
+
+# Reassign a source to a different sub-topic: unlink the old one, link the new
+drip topic add --name programming
+drip topic add --name "programming news" --parent programming
+drip source unlink --name rust-blog --topic "rust news"
+drip source link --name rust-blog --topic "programming news"
+
+# Fetch the whole main topic in one go -- expands to every sub-topic beneath it
 drip fetch --topic rust --tag rust
 
 # Fetch every saved source in one combined digest -- e.g. for a stable

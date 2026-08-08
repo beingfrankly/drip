@@ -1122,10 +1122,11 @@ fn handle_config(action: &ConfigAction, config: &Config) -> Result<()> {
     Ok(())
 }
 
-/// Handle `drip source add/move/remove/list` (drip-15n.9.6, extended by bd
-/// issue drip-38w.2 for the one-topic-per-source model): CRUD over the
-/// labeled, non-Reddit sources managed via `src/sources.rs`'s labeled-CRUD
-/// functions, plus reassigning a source's topic.
+/// Handle `drip source add/link/unlink/remove/list` (drip-15n.9.6, reworked
+/// by bd issue drip-ho5.8 for the two-level topic tree + many-to-many
+/// `topic_links`): CRUD over the labeled, non-Reddit sources managed via
+/// `src/sources.rs`'s labeled-CRUD functions, plus managing a source's links
+/// into sub-topics (and each link's keyword rules) via `src/topics.rs`.
 fn handle_source(action: &SourceAction, config: &Config) -> Result<()> {
     let conn = db::open(config)?;
     match action {
@@ -1140,11 +1141,19 @@ fn handle_source(action: &SourceAction, config: &Config) -> Result<()> {
                     args.search.as_deref(),
                 )?,
             };
-            // `drip source add` requires an already-existing topic (bd issue
-            // drip-38w.2) -- it does NOT auto-create one, unlike the
-            // drip-38w.1 interim "Uncategorized" default this replaces.
-            let topic_id = topics::require_topic_id(&conn, &args.topic)?;
-            sources::upsert_source(&conn, args.kind, &identifier, Some(&args.name), topic_id)?;
+            // `drip source add` requires an already-existing LEAF sub-topic
+            // (bd issue drip-ho5.8, per drip-98u.7's "sources link to
+            // sub-topics only" -- it does NOT auto-create one, and rejects
+            // a bare main topic with an actionable message pointing at
+            // `drip topic add --parent`).
+            let topic_id = topics::require_leaf_sub_topic_id(&conn, &args.topic)?;
+            let source_id =
+                sources::upsert_source(&conn, args.kind, &identifier, Some(&args.name), topic_id)?;
+            // Source-level excludes are declarative/replacing, same as
+            // `drip source link`'s `--match`/`--exclude` (bd issue
+            // drip-ho5.8) -- an omitted `--exclude` clears any existing
+            // terms, matching the "always sets full state" convention.
+            sources::set_source_excludes(&conn, source_id, &args.exclude)?;
             println!(
                 "saved source '{}' (topic: {}, kind: {}, url: {})",
                 args.name,
@@ -1153,9 +1162,28 @@ fn handle_source(action: &SourceAction, config: &Config) -> Result<()> {
                 identifier
             );
         }
-        SourceAction::Move { name, topic } => {
-            topics::move_source_to_topic(&conn, topic, name)?;
-            println!("moved source '{name}' to topic '{topic}'");
+        SourceAction::Link(args) => {
+            // Leaf-only enforcement happens here, ahead of the data-layer
+            // write (bd issue drip-ho5.8) -- `topics::link_source_to_topic`
+            // itself stays permissive so test fixtures elsewhere can still
+            // build a bare (pre-hierarchy) linked topic directly.
+            topics::require_leaf_sub_topic_id(&conn, &args.topic)?;
+            topics::link_source_to_topic(
+                &conn,
+                &args.name,
+                &args.topic,
+                &args.match_terms,
+                &args.exclude,
+                args.match_body,
+            )?;
+            println!("linked source '{}' to topic '{}'", args.name, args.topic);
+        }
+        SourceAction::Unlink { name, topic } => {
+            if topics::unlink_source_from_topic(&conn, name, topic)? {
+                println!("unlinked source '{name}' from topic '{topic}'");
+            } else {
+                println!("source '{name}' was not linked to topic '{topic}'");
+            }
         }
         SourceAction::Remove { name } => {
             if sources::remove_by_label(&conn, name)? {
@@ -1165,24 +1193,50 @@ fn handle_source(action: &SourceAction, config: &Config) -> Result<()> {
             }
         }
         SourceAction::List => {
-            // `SourceRow` no longer carries a topic (bd issue drip-ho5.3 --
-            // a source can now link into more than one sub-topic), so
-            // `list_with_topics` is used here instead of `list` to still
-            // print each source's topic membership. MINIMAL fix to keep
-            // this printing something sensible; slice 2 (drip-ho5.3)
-            // reworks this rendering for the two-level topic tree properly.
-            let saved = sources::list_with_topics(&conn)?;
+            let saved = sources::list(&conn)?;
             if saved.is_empty() {
                 println!("no sources saved yet");
             } else {
                 for row in &saved {
                     println!(
-                        "- {} (topic: {}, kind: {}, url: {})",
-                        row.source.display_name.as_deref().unwrap_or("?"),
-                        row.topics.join(", "),
-                        row.source.kind.as_str(),
-                        row.source.identifier
+                        "- {} (kind: {}, url: {})",
+                        row.display_name.as_deref().unwrap_or("?"),
+                        row.kind.as_str(),
+                        row.identifier
                     );
+                    let excludes = sources::source_excludes(&conn, row.id)?;
+                    if !excludes.is_empty() {
+                        println!("    source-exclude: {}", excludes.join(", "));
+                    }
+                    // `candidates_for_source` (bd issue drip-ho5.6) already
+                    // has exactly the shape `drip source list` wants to
+                    // print here -- each link's section + rules + match_body
+                    // -- so it's reused rather than a second query.
+                    let candidates = topics::candidates_for_source(&conn, row.id, None)?;
+                    if candidates.is_empty() {
+                        println!("    (not linked to any sub-topic)");
+                    }
+                    for candidate in &candidates {
+                        let mut parts = Vec::new();
+                        if !candidate.rules.include.is_empty() {
+                            parts.push(format!("match={}", candidate.rules.include.join(",")));
+                        }
+                        if !candidate.rules.exclude.is_empty() {
+                            parts.push(format!("exclude={}", candidate.rules.exclude.join(",")));
+                        }
+                        if candidate.match_body {
+                            parts.push("match-body".to_string());
+                        }
+                        let detail = if parts.is_empty() {
+                            "ruleless".to_string()
+                        } else {
+                            parts.join(" ")
+                        };
+                        println!(
+                            "    -> {} ({}): {}",
+                            candidate.section.sub_topic, candidate.section.main_topic, detail
+                        );
+                    }
                 }
             }
         }
@@ -1190,18 +1244,141 @@ fn handle_source(action: &SourceAction, config: &Config) -> Result<()> {
     Ok(())
 }
 
-/// Handle `drip topic add/remove/list` (bd issue drip-p6v.6, narrowed by bd
-/// issue drip-38w.2 for the one-topic-per-source model): CRUD over topics
-/// themselves, via `src/topics.rs`'s labeled-CRUD functions. Source-topic
-/// assignment now happens at `drip source add`/`drip source move` time
-/// instead (`handle_source` above), since a source belongs to exactly one
-/// topic -- there's no more "membership" to add/remove independently of that.
+/// One (source, sub-topic) candidate link's outcome against a `drip topic
+/// test --title` synthetic item -- see [`topic_test`].
+struct TopicTestLine {
+    source_label: String,
+    main_topic: String,
+    sub_topic: String,
+    outcome: classify::ItemOutcome,
+    /// Which of the candidate's include terms actually fired (bd issue
+    /// drip-ho5.8's "which terms fired" requirement). Empty either when the
+    /// candidate is ruleless (ANY item matches, so nothing "fired") or when
+    /// it didn't match at all.
+    fired_terms: Vec<String>,
+}
+
+/// Pure(-ish; reads `conn`) computation backing `drip topic test --title`
+/// (bd issue drip-ho5.8, per drip-98u.8's resolution point 3): classify a
+/// synthetic item -- `title` only, no body, since there's no fetched item to
+/// read a body from -- against EVERY saved source's sub-topic links, one
+/// [`TopicTestLine`] per (source, sub-topic) candidate. Offline and
+/// deterministic: no network, no fetch, reuses `classify::classify_item`
+/// unchanged (called once per candidate, so each link's own outcome is
+/// visible individually, rather than only the coarser per-source aggregate
+/// `classify_item`'s normal caller works with).
+fn topic_test(conn: &Connection, title: &str) -> Result<Vec<TopicTestLine>> {
+    let item = Item {
+        id: "drip-topic-test".to_string(),
+        title: title.to_string(),
+        url: String::new(),
+        comments_url: None,
+        author: None,
+        published_at: None,
+        summary: None,
+        score: None,
+        num_comments: None,
+        flair: None,
+        nsfw: false,
+    };
+
+    let mut lines = Vec::new();
+    for source in sources::list_with_topics(conn)? {
+        let label = source
+            .source
+            .display_name
+            .clone()
+            .unwrap_or_else(|| "?".to_string());
+        let excludes = sources::source_excludes(conn, source.source.id)?;
+        let candidates = topics::candidates_for_source(conn, source.source.id, None)?;
+
+        for candidate in &candidates {
+            let outcome =
+                classify::classify_item(&item, &excludes, std::slice::from_ref(candidate));
+            let fired_terms = match outcome {
+                classify::ItemOutcome::Routed(_) => {
+                    rules::matching_terms(&candidate.rules.include, &item.title)
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect()
+                }
+                _ => Vec::new(),
+            };
+            lines.push(TopicTestLine {
+                source_label: label.clone(),
+                main_topic: candidate.section.main_topic.clone(),
+                sub_topic: candidate.section.sub_topic.clone(),
+                outcome,
+                fired_terms,
+            });
+        }
+    }
+
+    Ok(lines)
+}
+
+/// Handle `drip topic add/rename/reparent/remove/list/test` (bd issue
+/// drip-p6v.6, reworked by bd issue drip-ho5.8 for the two-level topic
+/// tree): CRUD over topics themselves, via `src/topics.rs`'s labeled-CRUD
+/// functions. Source-to-topic linking happens at `drip source add`/`drip
+/// source link`/`drip source unlink` instead (`handle_source` above), since
+/// a source can now link into several sub-topics at once.
 fn handle_topic(action: &TopicAction, config: &Config) -> Result<()> {
     let conn = db::open(config)?;
     match action {
-        TopicAction::Add { name } => {
+        TopicAction::Add { name, parent: None } => {
             topics::create_topic(&conn, name)?;
             println!("created topic '{name}'");
+        }
+        TopicAction::Add {
+            name,
+            parent: Some(parent),
+        } => {
+            topics::create_sub_topic(&conn, name, parent)?;
+            println!("created sub-topic '{name}' under '{parent}'");
+        }
+        TopicAction::Rename { name, to } => {
+            // Checked BEFORE the rename (bd issue drip-ho5.8, per
+            // drip-98u.7's resolution) -- the heading text still reads
+            // `name` at this point; renaming first would make the check a
+            // no-op every time, since the OLD heading (if any) never
+            // matches the NEW name.
+            let settings = settings::load(&conn)?;
+            let had_heading = digest::todays_note_has_heading_for(
+                &config.vault_path,
+                &settings.posts_folder,
+                name,
+            )?;
+
+            topics::rename_topic(&conn, name, to)?;
+            println!("renamed topic '{name}' to '{to}'");
+
+            if had_heading {
+                println!(
+                    "warning: today's digest note already has a section for '{name}'; a fetch \
+                     today will add '{to}' as a NEW section alongside it rather than updating \
+                     the existing one (future-notes-only rename)"
+                );
+            }
+        }
+        TopicAction::Reparent { name, parent } => {
+            let settings = settings::load(&conn)?;
+            let had_heading = digest::todays_note_has_heading_for(
+                &config.vault_path,
+                &settings.posts_folder,
+                name,
+            )?;
+
+            topics::reparent_topic(&conn, name, parent)?;
+            println!("moved topic '{name}' under '{parent}'");
+
+            if had_heading {
+                println!(
+                    "warning: today's digest note already has a section for '{name}'; a fetch \
+                     today may render it under its previous main topic's heading alongside the \
+                     new one (future-notes-only reparent)"
+                );
+            }
         }
         TopicAction::Remove { name } => {
             // Check existence + "any descendant" before ever touching
@@ -1234,9 +1411,8 @@ fn handle_topic(action: &TopicAction, config: &Config) -> Result<()> {
             let link_count = topics::topic_link_count(&conn, name)?;
             if link_count > 0 {
                 anyhow::bail!(
-                    "topic '{name}' still has {link_count} source(s); move them to another \
-                     topic first (e.g. `drip source move --name <label> --topic <other>`) \
-                     before removing it"
+                    "topic '{name}' still has {link_count} source(s); unlink them first (e.g. \
+                     `drip source unlink --name <label> --topic {name}`) before removing it"
                 );
             }
 
@@ -1269,6 +1445,41 @@ fn handle_topic(action: &TopicAction, config: &Config) -> Result<()> {
                         );
                     }
                 }
+            }
+        }
+        TopicAction::Test { title } => {
+            let lines = topic_test(&conn, title)?;
+            if lines.is_empty() {
+                println!("no sources are linked to any sub-topic yet");
+                return Ok(());
+            }
+
+            let mut routed = Vec::new();
+            for line in &lines {
+                let target = format!("{} -> {}", line.source_label, line.sub_topic);
+                match &line.outcome {
+                    classify::ItemOutcome::Excluded => {
+                        println!("{target}  EXCLUDED (source-level exclude)");
+                    }
+                    classify::ItemOutcome::Dropped => {
+                        println!("{target}  no match");
+                    }
+                    classify::ItemOutcome::Routed(_) => {
+                        let why = if line.fired_terms.is_empty() {
+                            "no include terms; matches everything".to_string()
+                        } else {
+                            line.fired_terms.join(", ")
+                        };
+                        println!("{target}  MATCH  ({why})");
+                        routed.push(format!("{} > {}", line.main_topic, line.sub_topic));
+                    }
+                }
+            }
+
+            if routed.is_empty() {
+                println!("would route to: (nothing)");
+            } else {
+                println!("would route to: {}", routed.join(", "));
             }
         }
     }
@@ -1562,6 +1773,7 @@ mod tests {
         handle_topic(
             &TopicAction::Add {
                 name: "rust".to_string(),
+                parent: None,
             },
             &config,
         )
@@ -1580,6 +1792,7 @@ mod tests {
         handle_topic(
             &TopicAction::Add {
                 name: "rust".to_string(),
+                parent: None,
             },
             &config,
         )
@@ -1587,6 +1800,7 @@ mod tests {
         let err = handle_topic(
             &TopicAction::Add {
                 name: "rust".to_string(),
+                parent: None,
             },
             &config,
         )
@@ -1606,6 +1820,7 @@ mod tests {
             url: format!("https://example.com/{name}.xml"),
             name: name.to_string(),
             topic: topic.to_string(),
+            exclude: Vec::new(),
             sort: Sort::Hot,
             time: None,
             search: None,
@@ -1633,22 +1848,55 @@ mod tests {
         );
     }
 
+    /// Create a main topic `main` plus one leaf sub-topic `sub` under it, via
+    /// `handle_topic` (bd issue drip-ho5.8) -- the two-level shape required
+    /// by leaf-only source attachment. Returns nothing; callers name `sub`
+    /// again wherever a `--topic` value is needed.
+    fn add_main_and_sub_topic(config: &Config, main: &str, sub: &str) {
+        handle_topic(
+            &TopicAction::Add {
+                name: main.to_string(),
+                parent: None,
+            },
+            config,
+        )
+        .expect("creating the main topic should succeed");
+        handle_topic(
+            &TopicAction::Add {
+                name: sub.to_string(),
+                parent: Some(main.to_string()),
+            },
+            config,
+        )
+        .expect("creating the sub-topic should succeed");
+    }
+
+    fn source_link_args(
+        name: &str,
+        topic: &str,
+        match_terms: &[&str],
+        exclude: &[&str],
+        match_body: bool,
+    ) -> SourceAction {
+        SourceAction::Link(cli::SourceLinkArgs {
+            name: name.to_string(),
+            topic: topic.to_string(),
+            match_terms: match_terms.iter().map(|s| s.to_string()).collect(),
+            exclude: exclude.iter().map(|s| s.to_string()).collect(),
+            match_body,
+        })
+    }
+
     #[test]
     fn handle_source_add_ties_source_to_topic() {
         let (_dir, config) = fresh_config();
-        handle_topic(
-            &TopicAction::Add {
-                name: "rust".to_string(),
-            },
-            &config,
-        )
-        .unwrap();
+        add_main_and_sub_topic(&config, "rust", "rust (general)");
 
         handle_source(
-            &SourceAction::Add(rss_source_add_args("rust-blog", "rust")),
+            &SourceAction::Add(rss_source_add_args("rust-blog", "rust (general)")),
             &config,
         )
-        .expect("adding a source under an existing topic should succeed");
+        .expect("adding a source under an existing leaf sub-topic should succeed");
 
         let conn = db::open(&config).unwrap();
         let found = sources::find_by_label(&conn, "rust-blog")
@@ -1658,113 +1906,216 @@ mod tests {
         // `SourceRow` no longer carries topic membership (bd issue
         // drip-ho5.3) -- assert via `topic_names_for_source` instead.
         let topics = sources::topic_names_for_source(&conn, found.id).unwrap();
-        assert_eq!(topics, vec!["rust".to_string()]);
+        assert_eq!(topics, vec!["rust (general)".to_string()]);
     }
 
     #[test]
-    fn handle_source_move_round_trip() {
+    fn handle_source_add_rejects_linking_to_a_main_topic() {
         let (_dir, config) = fresh_config();
         handle_topic(
             &TopicAction::Add {
                 name: "rust".to_string(),
-            },
-            &config,
-        )
-        .unwrap();
-        handle_topic(
-            &TopicAction::Add {
-                name: "news".to_string(),
+                parent: None,
             },
             &config,
         )
         .unwrap();
 
-        handle_source(
+        let err = handle_source(
             &SourceAction::Add(rss_source_add_args("rust-blog", "rust")),
             &config,
         )
-        .expect("adding a source under 'rust' should succeed");
+        .expect_err("linking directly to a main topic should be rejected");
+
+        let message = err.to_string();
+        assert!(message.contains("rust"));
+        assert!(
+            message.contains("drip topic add"),
+            "error should point at creating a sub-topic: {message}"
+        );
+    }
+
+    #[test]
+    fn handle_source_add_writes_source_excludes() {
+        let (_dir, config) = fresh_config();
+        add_main_and_sub_topic(&config, "rust", "rust (general)");
+
+        let mut args = rss_source_add_args("rust-blog", "rust (general)");
+        args.exclude = vec!["megathread".to_string()];
+        handle_source(&SourceAction::Add(args), &config).expect("add should succeed");
+
+        let conn = db::open(&config).unwrap();
+        let id = sources::find_by_label(&conn, "rust-blog")
+            .unwrap()
+            .unwrap()
+            .id;
+        assert_eq!(
+            sources::source_excludes(&conn, id).unwrap(),
+            vec!["megathread".to_string()]
+        );
+    }
+
+    // -- bd issue drip-ho5.8: `drip source link`/`drip source unlink`
+    // replace `drip source move` (removed -- it expressed
+    // one-topic-per-source).
+
+    #[test]
+    fn handle_source_link_then_unlink_round_trip() {
+        let (_dir, config) = fresh_config();
+        add_main_and_sub_topic(&config, "rust", "rust (general)");
+        add_main_and_sub_topic(&config, "news", "news (general)");
+
+        handle_source(
+            &SourceAction::Add(rss_source_add_args("rust-blog", "rust (general)")),
+            &config,
+        )
+        .expect("adding a source under 'rust (general)' should succeed");
 
         {
             let conn = db::open(&config).unwrap();
             let listed = topics::list_topics(&conn).unwrap();
             let rust_topic = listed
                 .iter()
-                .find(|t| t.name == "rust")
-                .expect("'rust' topic should be in list_topics() output");
+                .find(|t| t.name == "rust (general)")
+                .expect("'rust (general)' topic should be in list_topics() output");
             assert_eq!(rust_topic.source_labels, vec!["rust-blog".to_string()]);
         }
 
         handle_source(
-            &SourceAction::Move {
+            &source_link_args("rust-blog", "news (general)", &[], &[], false),
+            &config,
+        )
+        .expect("linking into a second leaf sub-topic should succeed");
+        handle_source(
+            &SourceAction::Unlink {
                 name: "rust-blog".to_string(),
-                topic: "news".to_string(),
+                topic: "rust (general)".to_string(),
             },
             &config,
         )
-        .expect("moving a saved source to an existing topic should succeed");
+        .expect("unlinking from the original sub-topic should succeed");
 
         let conn = db::open(&config).unwrap();
         let listed = topics::list_topics(&conn).unwrap();
         let rust_topic = listed
             .iter()
-            .find(|t| t.name == "rust")
-            .expect("'rust' topic should be in list_topics() output");
+            .find(|t| t.name == "rust (general)")
+            .expect("'rust (general)' topic should be in list_topics() output");
         assert!(
             rust_topic.source_labels.is_empty(),
-            "source should have moved out of 'rust'"
+            "source should have moved out of 'rust (general)'"
         );
         let news_topic = listed
             .iter()
-            .find(|t| t.name == "news")
-            .expect("'news' topic should be in list_topics() output");
+            .find(|t| t.name == "news (general)")
+            .expect("'news (general)' topic should be in list_topics() output");
         assert_eq!(news_topic.source_labels, vec!["rust-blog".to_string()]);
     }
 
     #[test]
-    fn handle_source_move_errors_clearly_when_topic_missing() {
+    fn handle_source_link_replaces_match_and_exclude_lists_declaratively() {
         let (_dir, config) = fresh_config();
-        handle_topic(
-            &TopicAction::Add {
-                name: "rust".to_string(),
-            },
+        add_main_and_sub_topic(&config, "rust", "rust (general)");
+        handle_source(
+            &SourceAction::Add(rss_source_add_args("rust-blog", "rust (general)")),
             &config,
         )
         .unwrap();
+
         handle_source(
-            &SourceAction::Add(rss_source_add_args("rust-blog", "rust")),
+            &source_link_args(
+                "rust-blog",
+                "rust (general)",
+                &["hook", "skill"],
+                &["pricing"],
+                false,
+            ),
+            &config,
+        )
+        .expect("first link should succeed");
+        handle_source(
+            &source_link_args("rust-blog", "rust (general)", &["agent"], &[], true),
+            &config,
+        )
+        .expect("re-running link with different terms should replace, not append");
+
+        let conn = db::open(&config).unwrap();
+        let id = sources::find_by_label(&conn, "rust-blog")
+            .unwrap()
+            .unwrap()
+            .id;
+        let candidates = topics::candidates_for_source(&conn, id, None).unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].rules.include, vec!["agent".to_string()]);
+        assert!(candidates[0].rules.exclude.is_empty());
+        assert!(candidates[0].match_body);
+    }
+
+    #[test]
+    fn handle_source_link_rejects_linking_to_a_main_topic() {
+        let (_dir, config) = fresh_config();
+        add_main_and_sub_topic(&config, "rust", "rust (general)");
+        handle_source(
+            &SourceAction::Add(rss_source_add_args("rust-blog", "rust (general)")),
             &config,
         )
         .unwrap();
 
         let err = handle_source(
-            &SourceAction::Move {
+            &source_link_args("rust-blog", "rust", &[], &[], false),
+            &config,
+        )
+        .expect_err("linking directly to a main topic should be rejected");
+        assert!(err.to_string().contains("rust"));
+    }
+
+    #[test]
+    fn handle_source_unlink_of_a_never_linked_pair_is_a_benign_no_op() {
+        let (_dir, config) = fresh_config();
+        add_main_and_sub_topic(&config, "rust", "rust (general)");
+        add_main_and_sub_topic(&config, "news", "news (general)");
+        handle_source(
+            &SourceAction::Add(rss_source_add_args("rust-blog", "rust (general)")),
+            &config,
+        )
+        .unwrap();
+
+        handle_source(
+            &SourceAction::Unlink {
                 name: "rust-blog".to_string(),
-                topic: "does-not-exist".to_string(),
+                topic: "news (general)".to_string(),
             },
             &config,
         )
-        .expect_err("moving to a nonexistent topic should error");
+        .expect("unlinking a never-linked pair should succeed as a no-op");
+    }
+
+    #[test]
+    fn handle_source_link_errors_clearly_when_topic_missing() {
+        let (_dir, config) = fresh_config();
+        add_main_and_sub_topic(&config, "rust", "rust (general)");
+        handle_source(
+            &SourceAction::Add(rss_source_add_args("rust-blog", "rust (general)")),
+            &config,
+        )
+        .unwrap();
+
+        let err = handle_source(
+            &source_link_args("rust-blog", "does-not-exist", &[], &[], false),
+            &config,
+        )
+        .expect_err("linking into a nonexistent topic should error");
 
         assert!(err.to_string().contains("does-not-exist"));
     }
 
     #[test]
-    fn handle_source_move_errors_clearly_when_source_missing() {
+    fn handle_source_link_errors_clearly_when_source_missing() {
         let (_dir, config) = fresh_config();
-        handle_topic(
-            &TopicAction::Add {
-                name: "rust".to_string(),
-            },
-            &config,
-        )
-        .unwrap();
+        add_main_and_sub_topic(&config, "rust", "rust (general)");
 
         let err = handle_source(
-            &SourceAction::Move {
-                name: "does-not-exist".to_string(),
-                topic: "rust".to_string(),
-            },
+            &source_link_args("does-not-exist", "rust (general)", &[], &[], false),
             &config,
         )
         .expect_err("moving an unknown source should error");
@@ -1778,6 +2129,7 @@ mod tests {
         handle_topic(
             &TopicAction::Add {
                 name: "rust".to_string(),
+                parent: None,
             },
             &config,
         )
@@ -1797,27 +2149,28 @@ mod tests {
 
     #[test]
     fn handle_topic_remove_refuses_when_topic_has_sources() {
+        // Adapted for bd issue drip-ho5.8's leaf-only attachment: a topic
+        // can only directly own a source if it's a LEAF sub-topic now (a
+        // bare main topic can no longer be `--topic`'d directly, per
+        // `handle_source_add_rejects_linking_to_a_main_topic`), so this
+        // targets the leaf, not the main -- exercising the same "still has
+        // sources; unlink them first" guard end-to-end through
+        // `handle_source`/`handle_topic`.
         let (_dir, config) = fresh_config();
-        handle_topic(
-            &TopicAction::Add {
-                name: "rust".to_string(),
-            },
-            &config,
-        )
-        .unwrap();
+        add_main_and_sub_topic(&config, "rust", "rust (general)");
         handle_source(
-            &SourceAction::Add(rss_source_add_args("rust-blog", "rust")),
+            &SourceAction::Add(rss_source_add_args("rust-blog", "rust (general)")),
             &config,
         )
         .unwrap();
 
         let err = handle_topic(
             &TopicAction::Remove {
-                name: "rust".to_string(),
+                name: "rust (general)".to_string(),
             },
             &config,
         )
-        .expect_err("removing a non-empty topic should be refused");
+        .expect_err("removing a non-empty sub-topic should be refused");
 
         let message = err.to_string();
         assert!(
@@ -1825,14 +2178,14 @@ mod tests {
             "error should mention it still has sources: {message}"
         );
         assert!(
-            message.contains("move"),
-            "error should point at `drip source move`: {message}"
+            message.contains("unlink"),
+            "error should point at `drip source unlink`: {message}"
         );
 
         // Nothing should have been deleted.
         let conn = db::open(&config).unwrap();
         let listed = topics::list_topics(&conn).unwrap();
-        assert!(listed.iter().any(|t| t.name == "rust"));
+        assert!(listed.iter().any(|t| t.name == "rust (general)"));
         assert!(sources::find_by_label(&conn, "rust-blog")
             .unwrap()
             .is_some());
@@ -1910,8 +2263,8 @@ mod tests {
             "error should mention it still has sources: {message}"
         );
         assert!(
-            message.contains("move"),
-            "error should point at `drip source move`: {message}"
+            message.contains("unlink"),
+            "error should point at `drip source unlink`: {message}"
         );
 
         let conn = db::open(&config).unwrap();
@@ -1963,6 +2316,232 @@ mod tests {
         let (_dir, config) = fresh_config();
 
         handle_topic(&TopicAction::List, &config).expect("listing with no topics should succeed");
+    }
+
+    // -- bd issue drip-ho5.8: `topic add --parent`/`rename`/`reparent`/`test`.
+
+    #[test]
+    fn handle_topic_add_with_parent_creates_a_sub_topic() {
+        let (_dir, config) = fresh_config();
+        handle_topic(
+            &TopicAction::Add {
+                name: "Claude".to_string(),
+                parent: None,
+            },
+            &config,
+        )
+        .unwrap();
+
+        handle_topic(
+            &TopicAction::Add {
+                name: "cc hooks".to_string(),
+                parent: Some("Claude".to_string()),
+            },
+            &config,
+        )
+        .expect("creating a sub-topic under an existing main topic should succeed");
+
+        let conn = db::open(&config).unwrap();
+        let listed = topics::list_topics(&conn).unwrap();
+        let sub = listed
+            .iter()
+            .find(|t| t.name == "cc hooks")
+            .expect("sub-topic should be listed");
+        assert_eq!(sub.parent_name, Some("Claude".to_string()));
+    }
+
+    #[test]
+    fn handle_topic_add_rejects_a_name_with_a_comma() {
+        // The decisive case (drip-98u.1): also confirms `topic add --name`
+        // itself does NOT use `value_delimiter`, so this exercises
+        // `validate_topic_name`'s own rejection, not clap splitting the
+        // value first.
+        let (_dir, config) = fresh_config();
+
+        let err = handle_topic(
+            &TopicAction::Add {
+                name: "Rust, News".to_string(),
+                parent: None,
+            },
+            &config,
+        )
+        .expect_err("a comma in a topic name should be rejected");
+        assert!(err.to_string().contains(','));
+    }
+
+    #[test]
+    fn handle_topic_add_with_parent_rejects_a_two_level_violation() {
+        let (_dir, config) = fresh_config();
+        add_main_and_sub_topic(&config, "Claude", "Claude (general)");
+
+        let err = handle_topic(
+            &TopicAction::Add {
+                name: "third level".to_string(),
+                parent: Some("Claude (general)".to_string()),
+            },
+            &config,
+        )
+        .expect_err("parenting under a sub-topic should be rejected");
+        assert!(err.to_string().contains("Claude (general)"));
+    }
+
+    #[test]
+    fn handle_topic_rename_updates_the_name() {
+        let (_dir, config) = fresh_config();
+        add_main_and_sub_topic(&config, "Claude", "loop engineering");
+
+        handle_topic(
+            &TopicAction::Rename {
+                name: "loop engineering".to_string(),
+                to: "agent loops".to_string(),
+            },
+            &config,
+        )
+        .expect("rename should succeed");
+
+        let conn = db::open(&config).unwrap();
+        let listed = topics::list_topics(&conn).unwrap();
+        assert!(!listed.iter().any(|t| t.name == "loop engineering"));
+        assert!(listed.iter().any(|t| t.name == "agent loops"));
+    }
+
+    #[test]
+    fn handle_topic_rename_warns_when_todays_note_already_has_the_old_heading() {
+        let (_db_dir, vault_dir, config) = fresh_config_with_vault();
+        add_main_and_sub_topic(&config, "Claude", "loop engineering");
+
+        let run = digest::DigestRun {
+            sort: Sort::Hot,
+            time: None,
+            query: None,
+            tags: vec![],
+            items_by_subtopic: vec![],
+            sources: vec![],
+            created_at: chrono::Utc::now(),
+        };
+        // A rendered note needs at least one section to have a heading at
+        // all -- write one directly under the sub-topic being renamed,
+        // mirroring `digest.rs`'s own `write_digest_note` shape.
+        let posts_dir = vault_dir.path().join("Resources/Reddit");
+        std::fs::create_dir_all(&posts_dir).unwrap();
+        let filename = digest::digest_filename(&run);
+        std::fs::write(
+            posts_dir.join(&filename),
+            "## Claude\n\n### loop engineering\n\n- [ ] **[x](https://example.com)**\n",
+        )
+        .unwrap();
+
+        // Renaming should still succeed -- the warning is advisory, not a
+        // refusal (bd issue drip-ho5.8, per drip-98u.7's resolution).
+        handle_topic(
+            &TopicAction::Rename {
+                name: "loop engineering".to_string(),
+                to: "agent loops".to_string(),
+            },
+            &config,
+        )
+        .expect("rename should succeed even when today's note already has the old heading");
+
+        let conn = db::open(&config).unwrap();
+        assert!(topics::list_topics(&conn)
+            .unwrap()
+            .iter()
+            .any(|t| t.name == "agent loops"));
+    }
+
+    #[test]
+    fn handle_topic_reparent_moves_a_sub_topic_under_a_different_main() {
+        let (_dir, config) = fresh_config();
+        add_main_and_sub_topic(&config, "Claude", "cc hooks");
+        handle_topic(
+            &TopicAction::Add {
+                name: "Rust".to_string(),
+                parent: None,
+            },
+            &config,
+        )
+        .unwrap();
+
+        handle_topic(
+            &TopicAction::Reparent {
+                name: "cc hooks".to_string(),
+                parent: "Rust".to_string(),
+            },
+            &config,
+        )
+        .expect("reparent should succeed");
+
+        let conn = db::open(&config).unwrap();
+        let listed = topics::list_topics(&conn).unwrap();
+        assert_eq!(
+            listed
+                .iter()
+                .find(|t| t.name == "cc hooks")
+                .unwrap()
+                .parent_name,
+            Some("Rust".to_string())
+        );
+    }
+
+    #[test]
+    fn topic_test_reports_match_no_match_and_exclusion() {
+        let (_dir, config) = fresh_config();
+        add_main_and_sub_topic(&config, "Claude", "cc hooks");
+        handle_source(
+            &SourceAction::Add(rss_source_add_args("cc-hooks-feed", "cc hooks")),
+            &config,
+        )
+        .unwrap();
+        handle_source(
+            &source_link_args("cc-hooks-feed", "cc hooks", &["hook"], &[], false),
+            &config,
+        )
+        .unwrap();
+
+        let conn = db::open(&config).unwrap();
+
+        let matching = topic_test(&conn, "Claude Code hooks changed how I work").unwrap();
+        assert_eq!(matching.len(), 1);
+        assert_eq!(matching[0].sub_topic, "cc hooks");
+        assert_eq!(
+            matching[0].outcome,
+            classify::ItemOutcome::Routed(vec![classify::Section {
+                main_topic: "Claude".to_string(),
+                sub_topic: "cc hooks".to_string(),
+            }])
+        );
+        assert_eq!(matching[0].fired_terms, vec!["hook".to_string()]);
+
+        let not_matching = topic_test(&conn, "My game demo is on Steam").unwrap();
+        assert_eq!(not_matching[0].outcome, classify::ItemOutcome::Dropped);
+        assert!(not_matching[0].fired_terms.is_empty());
+    }
+
+    #[test]
+    fn topic_test_reports_source_level_exclusion() {
+        let (_dir, config) = fresh_config();
+        add_main_and_sub_topic(&config, "Claude", "cc hooks");
+        let mut args = rss_source_add_args("cc-hooks-feed", "cc hooks");
+        args.exclude = vec!["megathread".to_string()];
+        handle_source(&SourceAction::Add(args), &config).unwrap();
+
+        let conn = db::open(&config).unwrap();
+        let lines = topic_test(&conn, "Claude Model Performance Megathread").unwrap();
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].outcome, classify::ItemOutcome::Excluded);
+    }
+
+    #[test]
+    fn handle_topic_test_succeeds_with_no_sources_linked() {
+        let (_dir, config) = fresh_config();
+
+        handle_topic(
+            &TopicAction::Test {
+                title: "anything".to_string(),
+            },
+            &config,
+        )
+        .expect("topic test should succeed even with nothing linked yet");
     }
 
     // -- `--topic` resolution/wiring tests (bd issue drip-p6v.7) --
@@ -2055,9 +2634,16 @@ mod tests {
             for label in ["a", "b", "c"] {
                 register_mocked_rss_source(&conn, &mut server, label);
             }
-            topics::create_topic(&conn, "typescript").unwrap();
+            let typescript_tid = topics::create_topic(&conn, "typescript").unwrap();
             for label in ["a", "b", "c"] {
-                topics::move_source_to_topic(&conn, "typescript", label).unwrap();
+                {
+                    let source_id = sources::find_by_label(&conn, label).unwrap().unwrap().id;
+                    conn.execute(
+                        "INSERT INTO topic_links (source_id, topic_id) VALUES (?1, ?2) ON CONFLICT(source_id, topic_id) DO NOTHING",
+                        rusqlite::params![source_id, typescript_tid],
+                    )
+                    .unwrap();
+                }
             }
         }
 
@@ -2087,9 +2673,16 @@ mod tests {
             for label in ["a", "b", "c"] {
                 register_mocked_rss_source(&conn, &mut server, label);
             }
-            topics::create_topic(&conn, "typescript").unwrap();
+            let typescript_tid = topics::create_topic(&conn, "typescript").unwrap();
             for label in ["a", "b", "c"] {
-                topics::move_source_to_topic(&conn, "typescript", label).unwrap();
+                {
+                    let source_id = sources::find_by_label(&conn, label).unwrap().unwrap().id;
+                    conn.execute(
+                        "INSERT INTO topic_links (source_id, topic_id) VALUES (?1, ?2) ON CONFLICT(source_id, topic_id) DO NOTHING",
+                        rusqlite::params![source_id, typescript_tid],
+                    )
+                    .unwrap();
+                }
             }
         }
 
@@ -2141,9 +2734,16 @@ mod tests {
                 register_mocked_rss_source(&conn, &mut server, label);
             }
             if use_topic {
-                topics::create_topic(&conn, "typescript").unwrap();
+                let typescript_tid = topics::create_topic(&conn, "typescript").unwrap();
                 for label in ["a", "b", "c"] {
-                    topics::move_source_to_topic(&conn, "typescript", label).unwrap();
+                    {
+                        let source_id = sources::find_by_label(&conn, label).unwrap().unwrap().id;
+                        conn.execute(
+                        "INSERT INTO topic_links (source_id, topic_id) VALUES (?1, ?2) ON CONFLICT(source_id, topic_id) DO NOTHING",
+                        rusqlite::params![source_id, typescript_tid],
+                    )
+                    .unwrap();
+                    }
                 }
             }
         }
@@ -2173,9 +2773,25 @@ mod tests {
             for label in ["x", "b", "c"] {
                 register_mocked_rss_source(&conn, &mut server, label);
             }
-            topics::create_topic(&conn, "typescript").unwrap();
+            let typescript_tid = topics::create_topic(&conn, "typescript").unwrap();
             for label in ["x", "b", "c"] {
-                topics::move_source_to_topic(&conn, "typescript", label).unwrap();
+                let source_id = sources::find_by_label(&conn, label).unwrap().unwrap().id;
+                // Replace the "Uncategorized" link `register_mocked_rss_source`
+                // creates with one into "typescript" -- a direct `--source x`
+                // fetch (unlike a `--topic`-scoped one) uses EVERY one of the
+                // source's links as candidates, so leaving both links in
+                // place would make "x" multi-match into both sections,
+                // defeating this test's "exactly once" assertion below.
+                conn.execute(
+                    "DELETE FROM topic_links WHERE source_id = ?1",
+                    rusqlite::params![source_id],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO topic_links (source_id, topic_id) VALUES (?1, ?2)",
+                    rusqlite::params![source_id, typescript_tid],
+                )
+                .unwrap();
             }
         }
 
@@ -2411,9 +3027,15 @@ mod tests {
             tid,
         )
         .unwrap();
-        topics::create_topic(&conn, "typescript").unwrap();
-        topics::move_source_to_topic(&conn, "typescript", "a").unwrap();
-        topics::move_source_to_topic(&conn, "typescript", "b").unwrap();
+        let typescript_tid = topics::create_topic(&conn, "typescript").unwrap();
+        for label in ["a", "b"] {
+            let source_id = sources::find_by_label(&conn, label).unwrap().unwrap().id;
+            conn.execute(
+                "INSERT INTO topic_links (source_id, topic_id) VALUES (?1, ?2)",
+                rusqlite::params![source_id, typescript_tid],
+            )
+            .unwrap();
+        }
 
         let (labels, warnings) = resolve_topic_labels(&conn, &["typescript".to_string()]);
 

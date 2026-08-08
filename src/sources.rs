@@ -306,35 +306,29 @@ pub fn remove_by_label(conn: &Connection, label: &str) -> Result<bool> {
     Ok(changed > 0)
 }
 
-/// Assign/move the source labeled `source_label` to the topic `topic_id`
-/// (bd issue drip-38w.1, repointed by bd issue drip-ho5.3). No longer writes
-/// the dead `sources.topic_id` column -- instead replaces the source's
-/// `topic_links` rows with a single link to `topic_id`, the closest
-/// equivalent of "move" under the new many-to-many shape. This is the single
-/// place a source's topic membership is ever reassigned wholesale after its
-/// initial insert -- `crate::topics::move_source_to_topic` (backing `drip
-/// source move`) is its sole caller.
-///
-/// Errors clearly if no source has `source_label` -- mirrors
-/// `crate::topics::source_by_label`'s "no source named ... (run `drip source
-/// list`)" message, since callers here are typically already holding a topic
-/// name and need the same clarity bar for an unknown source label.
-pub fn set_source_topic(conn: &Connection, source_label: &str, topic_id: i64) -> Result<()> {
-    let source = find_by_label(conn, source_label)?.ok_or_else(|| {
-        anyhow::anyhow!("no source named '{source_label}' (run `drip source list`)")
-    })?;
-
+/// Declaratively (re)configure `source_id`'s title-only exclude terms in
+/// `source_excludes` (`migrations/0006_topic_tree.sql`) -- backs `drip
+/// source add --exclude` (bd issue drip-ho5.8). REPLACES the source's entire
+/// exclude list wholesale, same "declarative upsert" convention as
+/// `crate::topics::link_source_to_topic`'s `--match`/`--exclude` (drip-98u.8):
+/// re-running with the same `terms` is idempotent and produces identical
+/// state. A plain DELETE-then-INSERT, so this never touches `seen_items` or
+/// any `topic_links`/`link_rules` row -- source-level excludes are a
+/// pre-filter that runs before any topic-link classification.
+pub fn set_source_excludes(conn: &Connection, source_id: i64, terms: &[String]) -> Result<()> {
     conn.execute(
-        "DELETE FROM topic_links WHERE source_id = ?1",
-        params![source.id],
+        "DELETE FROM source_excludes WHERE source_id = ?1",
+        params![source_id],
     )
-    .with_context(|| format!("failed to clear existing topic links for source '{source_label}'"))?;
+    .with_context(|| format!("failed to clear existing excludes for source id {source_id}"))?;
 
-    conn.execute(
-        "INSERT INTO topic_links (source_id, topic_id) VALUES (?1, ?2)",
-        params![source.id, topic_id],
-    )
-    .with_context(|| format!("failed to set topic for source '{source_label}'"))?;
+    for term in terms {
+        conn.execute(
+            "INSERT INTO source_excludes (source_id, term) VALUES (?1, ?2)",
+            params![source_id, term],
+        )
+        .with_context(|| format!("failed to insert exclude '{term}' for source id {source_id}"))?;
+    }
 
     Ok(())
 }
@@ -559,35 +553,78 @@ mod tests {
         );
     }
 
-    #[test]
-    fn set_source_topic_moves_the_source_to_the_given_topic() {
-        let (_dir, conn) = fresh_conn();
-        let tid_a = crate::topics::get_or_create_topic(&conn, "a").unwrap();
-        let tid_b = crate::topics::get_or_create_topic(&conn, "b").unwrap();
+    // -- bd issue drip-ho5.8: `set_source_excludes` replaces
+    // `set_source_topic` (removed -- it expressed one-topic-per-source,
+    // which is no longer meaningful under many-to-many `topic_links`;
+    // reassignment is now `topics::unlink_source_from_topic` +
+    // `topics::link_source_to_topic` instead).
 
-        upsert_source(
+    #[test]
+    fn set_source_excludes_is_readable_via_source_excludes() {
+        let (_dir, conn) = fresh_conn();
+        let tid = crate::topics::get_or_create_topic(&conn, "Uncategorized").unwrap();
+        let id = upsert_source(
             &conn,
             SourceKind::Rss,
             "https://example.com/feed.xml",
             Some("rust-blog"),
-            tid_a,
+            tid,
         )
         .expect("upsert should succeed");
 
-        set_source_topic(&conn, "rust-blog", tid_b).expect("set_source_topic should succeed");
+        set_source_excludes(&conn, id, &["megathread".to_string(), "hiring".to_string()])
+            .expect("set_source_excludes should succeed");
 
-        let found = find_by_label(&conn, "rust-blog")
-            .unwrap()
-            .expect("source should still exist");
+        let terms = source_excludes(&conn, id).expect("source_excludes should succeed");
+        assert_eq!(terms.len(), 2);
+        assert!(terms.contains(&"megathread".to_string()));
+        assert!(terms.contains(&"hiring".to_string()));
+    }
 
-        // `SourceRow` no longer carries topic membership (bd issue
-        // drip-ho5.3) -- assert the `topic_links` row directly: the source
-        // should be linked ONLY to the new topic, its old link replaced
-        // rather than left alongside it.
-        let listed = list_with_topics(&conn).expect("list_with_topics should succeed");
-        assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].source.id, found.id);
-        assert_eq!(listed[0].topics, vec!["b".to_string()]);
+    #[test]
+    fn set_source_excludes_replaces_the_list_wholesale() {
+        let (_dir, conn) = fresh_conn();
+        let tid = crate::topics::get_or_create_topic(&conn, "Uncategorized").unwrap();
+        let id = upsert_source(
+            &conn,
+            SourceKind::Rss,
+            "https://example.com/feed.xml",
+            Some("rust-blog"),
+            tid,
+        )
+        .expect("upsert should succeed");
+
+        set_source_excludes(&conn, id, &["megathread".to_string()])
+            .expect("first set should succeed");
+        set_source_excludes(&conn, id, &["hiring".to_string()])
+            .expect("second set should replace the first, not append");
+
+        let terms = source_excludes(&conn, id).expect("source_excludes should succeed");
+        assert_eq!(
+            terms,
+            vec!["hiring".to_string()],
+            "re-running with a different list should replace it wholesale, not accumulate"
+        );
+    }
+
+    #[test]
+    fn set_source_excludes_with_an_empty_list_clears_any_existing_terms() {
+        let (_dir, conn) = fresh_conn();
+        let tid = crate::topics::get_or_create_topic(&conn, "Uncategorized").unwrap();
+        let id = upsert_source(
+            &conn,
+            SourceKind::Rss,
+            "https://example.com/feed.xml",
+            Some("rust-blog"),
+            tid,
+        )
+        .expect("upsert should succeed");
+
+        set_source_excludes(&conn, id, &["megathread".to_string()])
+            .expect("first set should succeed");
+        set_source_excludes(&conn, id, &[]).expect("clearing with an empty list should succeed");
+
+        assert!(source_excludes(&conn, id).unwrap().is_empty());
     }
 
     #[test]
@@ -657,18 +694,5 @@ mod tests {
             vec!["alpha".to_string(), "zeta".to_string()],
             "linked sub-topics should be returned sorted by name"
         );
-    }
-
-    #[test]
-    fn set_source_topic_errors_clearly_for_an_unknown_label() {
-        let (_dir, conn) = fresh_conn();
-        let tid = crate::topics::get_or_create_topic(&conn, "Uncategorized").unwrap();
-
-        let err = set_source_topic(&conn, "does-not-exist", tid)
-            .expect_err("unknown source label should error");
-
-        let message = err.to_string();
-        assert!(message.contains("does-not-exist"));
-        assert!(message.contains("drip source list"));
     }
 }

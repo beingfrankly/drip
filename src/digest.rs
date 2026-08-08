@@ -596,6 +596,42 @@ fn extend_inline_list(lines: &mut [String], prefix: &str, additions: &[String]) 
     }
 }
 
+/// Whether TODAY's already-written digest note (if one exists) contains a
+/// section heading -- H2 `## {name}` or H3 `### {name}` -- for `name` (bd
+/// issue drip-ho5.8): backs `drip topic rename`/the reparent verb's
+/// "warn, don't rewrite" behavior (per drip-98u.7's resolution). Headings
+/// are located by exact full-line equality, mirroring `insert_item_lines`'s
+/// own matching -- a same-day rename means the next fetch cannot find the
+/// old heading and appends a fresh one alongside it instead, which is
+/// confusing but not destructive (and gone by tomorrow), so this function
+/// only reports the fact; it never rewrites the note itself. Returns
+/// `Ok(false)` (not an error) when there's no note for today yet.
+pub fn todays_note_has_heading_for(
+    vault_path: &Path,
+    posts_folder: &str,
+    name: &str,
+) -> Result<bool> {
+    let filename = sanitize_filename(&format!(
+        "{} - Daily digest.md",
+        Local::now().format("%Y-%m-%d")
+    ));
+    let path = vault_path.join(posts_folder).join(filename);
+
+    let content = match fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!("failed to read today's digest note at {}", path.display())
+            })
+        }
+    };
+
+    let h2 = format!("## {name}");
+    let h3 = format!("### {name}");
+    Ok(content.lines().any(|l| l == h2 || l == h3))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1458,5 +1494,65 @@ mod tests {
              false duplicate:\n{merged}"
         );
         assert!(merged.contains("### hooks") && merged.contains("### skills"));
+    }
+
+    // -- bd issue drip-ho5.8: `todays_note_has_heading_for` backs `drip
+    // topic rename`/the reparent verb's "warn, don't rewrite" behavior.
+
+    #[test]
+    fn todays_note_has_heading_for_returns_false_when_no_note_exists_yet() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let found = todays_note_has_heading_for(dir.path(), "Resources/drip", "Claude")
+            .expect("should succeed even with no note yet");
+        assert!(!found);
+    }
+
+    /// Like [`sample_run_with_topics`], but with `created_at` set to right
+    /// now -- required for `todays_note_has_heading_for` tests, since
+    /// `sample_run_with_topics`'s own fixed 2026-07-08 timestamp would write
+    /// under a filename that is never "today" once this test runs on any
+    /// other date.
+    fn sample_run_with_topics_today(entries: Vec<(&str, &str, Vec<Item>)>) -> DigestRun {
+        DigestRun {
+            created_at: Utc::now(),
+            ..sample_run_with_topics(entries)
+        }
+    }
+
+    #[test]
+    fn todays_note_has_heading_for_finds_an_h2_main_topic_heading() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let run =
+            sample_run_with_topics_today(vec![("Claude", "cc hooks", vec![sample_item("a", "x")])]);
+        write_digest_note(dir.path(), "Resources/drip", &run).expect("write should succeed");
+
+        let found = todays_note_has_heading_for(dir.path(), "Resources/drip", "Claude")
+            .expect("should succeed");
+        assert!(found, "an H2 heading for the main topic should be found");
+    }
+
+    #[test]
+    fn todays_note_has_heading_for_finds_an_h3_sub_topic_heading() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let run =
+            sample_run_with_topics_today(vec![("Claude", "cc hooks", vec![sample_item("a", "x")])]);
+        write_digest_note(dir.path(), "Resources/drip", &run).expect("write should succeed");
+
+        let found = todays_note_has_heading_for(dir.path(), "Resources/drip", "cc hooks")
+            .expect("should succeed");
+        assert!(found, "an H3 heading for the sub-topic should be found");
+    }
+
+    #[test]
+    fn todays_note_has_heading_for_returns_false_for_a_name_not_in_the_note() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let run =
+            sample_run_with_topics_today(vec![("Claude", "cc hooks", vec![sample_item("a", "x")])]);
+        write_digest_note(dir.path(), "Resources/drip", &run).expect("write should succeed");
+
+        let found = todays_note_has_heading_for(dir.path(), "Resources/drip", "Rust")
+            .expect("should succeed");
+        assert!(!found);
     }
 }

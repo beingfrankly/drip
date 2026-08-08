@@ -29,20 +29,26 @@ pub enum Commands {
         #[command(subcommand)]
         action: ConfigAction,
     },
-    /// Manage saved non-Reddit sources (RSS feeds, etc.). Every source
-    /// belongs to exactly one topic (see `Commands::Topic`'s doc comment) --
-    /// `drip source add` requires an existing `--topic`, and `drip source
-    /// move` reassigns an already-saved source to a different one.
+    /// Manage saved non-Reddit sources (RSS feeds, etc.). `drip source add`
+    /// requires an existing (leaf sub-topic) `--topic` and creates one
+    /// ruleless (accept-everything) link; `drip source link`/`drip source
+    /// unlink` manage a source's links -- and each link's keyword rules --
+    /// into further sub-topics from there (bd issue drip-ho5.8; see
+    /// `Commands::Topic`'s doc comment for the two-level topic tree these
+    /// link into).
     Source {
         #[command(subcommand)]
         action: SourceAction,
     },
-    /// Manage topics: named groups of saved sources. A source belongs to
-    /// EXACTLY ONE topic at a time (tracked by `sources.topic_id`) -- there
-    /// is no many-to-many membership anymore. Assign a source to a topic at
-    /// `drip source add --topic` time, or reassign an existing one with
-    /// `drip source move --topic`; this subcommand only manages the topics
-    /// themselves (create/list/remove).
+    /// Manage topics: a two-level tree of main topics and their sub-topics
+    /// (bd issue drip-ho5.8, migration `0006_topic_tree.sql`). A source
+    /// links into one or more LEAF sub-topics -- never a main topic directly
+    /// -- via `drip source add --topic`/`drip source link --topic`, each
+    /// link carrying its own keyword rules (`--match`/`--exclude`) that
+    /// route a fetched item into that sub-topic. This subcommand manages the
+    /// topics themselves (create/rename/reparent/remove/list) and offers an
+    /// offline explain surface (`drip topic test`); it does not manage
+    /// source-to-topic links -- that's `drip source add`/`link`/`unlink`.
     Topic {
         #[command(subcommand)]
         action: TopicAction,
@@ -74,7 +80,13 @@ pub struct FetchArgs {
     #[arg(short = 'q', long = "query")]
     pub query: Option<String>,
 
-    /// Number of posts to fetch. Falls back to the saved `default_limit`
+    /// Caps how many items are WRITTEN per source, applied AFTER dedup and
+    /// keyword-rule classification, not before (bd issue drip-98u.4) -- the
+    /// per-source pipeline is fetch -> dedup -> classify -> truncate, so
+    /// this is "at most N items routed from this source", never "take the
+    /// first N raw fetched items and see what routes" (truncating the raw
+    /// feed first can leave zero routable items if a source's noisiest
+    /// posts happen to sort first). Falls back to the saved `default_limit`
     /// setting when not given.
     #[arg(short = 'n', long = "limit")]
     pub limit: Option<u32>,
@@ -161,12 +173,24 @@ pub enum ConfigAction {
 pub enum SourceAction {
     /// Register a new non-Reddit source
     Add(SourceAddArgs),
-    /// Move a saved source to a different (existing) topic
-    Move {
-        /// Label of the source to move (see `drip source list`)
+    /// Declaratively (re)configure the link between a saved source and a
+    /// sub-topic (bd issue drip-ho5.8). `--match`/`--exclude` REPLACE that
+    /// link's entire include/exclude term lists -- re-running the same
+    /// command is idempotent and produces identical state, which is what
+    /// makes a shell script the reproducible way to author a source's rule
+    /// set. Never touches the source's dedup ledger (`seen_items`): editing
+    /// a link's rules is a plain row-level change against `link_rules`, not
+    /// a remove-and-re-add of the source itself.
+    Link(SourceLinkArgs),
+    /// Remove the link (and its keyword rules) between a saved source and a
+    /// sub-topic. A source with no remaining links still exists (it just
+    /// routes nowhere until linked again) -- this never deletes the source
+    /// itself.
+    Unlink {
+        /// Label of the source to unlink (see `drip source list`)
         #[arg(long)]
         name: String,
-        /// Destination topic name (must already exist)
+        /// Sub-topic to unlink from
         #[arg(long)]
         topic: String,
     },
@@ -175,8 +199,37 @@ pub enum SourceAction {
         #[arg(long)]
         name: String,
     },
-    /// List saved sources
+    /// List saved sources, each with its links and their rules
     List,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct SourceLinkArgs {
+    /// Label of the source to link (see `drip source list`)
+    #[arg(long)]
+    pub name: String,
+    /// Sub-topic to link into -- must already exist and be a LEAF sub-topic
+    /// (create one with `drip topic add --name <sub-topic> --parent <main>`);
+    /// linking directly to a main topic is rejected.
+    #[arg(long)]
+    pub topic: String,
+    /// Include terms: REPLACES this link's entire include list wholesale.
+    /// An item must match at least one to route here, unless the list is
+    /// empty, in which case everything matches. Repeat the flag or pass a
+    /// comma-separated list. Omitting this flag entirely clears the include
+    /// list (declarative: this command always sets the link's FULL state,
+    /// never appends to it).
+    #[arg(long = "match", value_delimiter = ',')]
+    pub match_terms: Vec<String>,
+    /// Exclude terms: REPLACES this link's entire exclude list wholesale.
+    /// Any match rejects the item outright, regardless of the include side.
+    /// Repeat the flag or pass a comma-separated list.
+    #[arg(long, value_delimiter = ',')]
+    pub exclude: Vec<String>,
+    /// Also match an item's body/summary text, not just its title, for this
+    /// link specifically.
+    #[arg(long = "match-body")]
+    pub match_body: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -185,15 +238,55 @@ pub enum TopicAction {
     Add {
         #[arg(long)]
         name: String,
+        /// Create this as a sub-topic under an existing MAIN topic, rather
+        /// than a new main topic. Topics are exactly two levels deep --
+        /// naming a sub-topic here (one that itself already has a parent)
+        /// is rejected.
+        #[arg(long)]
+        parent: Option<String>,
     },
-    /// Remove a topic. Refuses if the topic still owns any sources -- move
-    /// them elsewhere first with `drip source move`.
+    /// Rename a topic. Future-notes-only: updates the DB but never rewrites
+    /// an already-written digest note. If TODAY's digest note already has a
+    /// section under the old name, this warns (a same-day fetch will add a
+    /// second, differently-named section alongside it rather than updating
+    /// the existing one) rather than rewriting the note.
+    Rename {
+        #[arg(long)]
+        name: String,
+        #[arg(long = "to")]
+        to: String,
+    },
+    /// Move a sub-topic to a different main topic. Same future-notes-only
+    /// warning as `rename` if today's digest note already has a section for
+    /// it under its previous main topic.
+    Reparent {
+        /// The sub-topic to move
+        #[arg(long)]
+        name: String,
+        /// Its new main topic (must already exist and not itself be a
+        /// sub-topic)
+        #[arg(long)]
+        parent: String,
+    },
+    /// Remove a topic. Refuses while it has any descendant: a main topic
+    /// refuses while it still has sub-topics; a topic (main or sub) refuses
+    /// while it still has directly-linked sources -- unlink them first with
+    /// `drip source unlink`.
     Remove {
         #[arg(long)]
         name: String,
     },
-    /// List saved topics and their member sources
+    /// List saved topics as a two-level tree, each with its member sources
     List,
+    /// Offline, no-network explain surface (bd issue drip-ho5.8): classify a
+    /// synthetic item (title only) against every saved source's sub-topic
+    /// links, printing which links match, which terms fired, and where the
+    /// item would land. Answers "why did nothing land in this sub-topic?"
+    /// without spending a real fetch.
+    Test {
+        #[arg(long)]
+        title: String,
+    },
 }
 
 #[derive(Debug, Clone, Args)]
@@ -212,10 +305,21 @@ pub struct SourceAddArgs {
     #[arg(long)]
     pub name: String,
 
-    /// Topic this source belongs to. The topic must already exist -- create
-    /// it with `drip topic add`. Every source belongs to exactly one topic.
+    /// The (leaf) sub-topic this source links into. Must already exist --
+    /// create it with `drip topic add --name <sub-topic> --parent <main>`.
+    /// Creates exactly one ruleless (accept-everything) link; use `drip
+    /// source link` afterwards to add keyword rules or link into further
+    /// sub-topics.
     #[arg(long)]
     pub topic: String,
+
+    /// Source-level, title-only exclude terms -- a pre-filter applied
+    /// before this source's items are matched against any sub-topic's
+    /// rules at all. REPLACES the source's entire exclude list wholesale
+    /// (declarative, same convention as `drip source link`'s `--match`/
+    /// `--exclude`). Repeat the flag or pass a comma-separated list.
+    #[arg(long, value_delimiter = ',')]
+    pub exclude: Vec<String>,
 
     /// Sort order for this source (only meaningful with --kind reddit;
     /// ignored otherwise)

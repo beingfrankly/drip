@@ -127,6 +127,19 @@ fn term_matches_at_word_boundary(haystack: &str, term: &str) -> bool {
     false
 }
 
+/// Which of `terms` match `haystack` at a word boundary, in `terms`' own
+/// order -- backs `drip topic test`'s "which terms fired" explain output
+/// (bd issue drip-ho5.8). Reuses the exact same private matching primitive
+/// `RuleSet::matches` itself calls, so this can never disagree with the real
+/// matching decision.
+pub fn matching_terms<'a>(terms: &'a [String], haystack: &str) -> Vec<&'a str> {
+    terms
+        .iter()
+        .filter(|term| term_matches_at_word_boundary(haystack, term))
+        .map(|term| term.as_str())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -286,5 +299,19 @@ mod tests {
             "an empty haystack should also match when there are no include \
              terms to filter on"
         );
+    }
+
+    #[test]
+    fn matching_terms_returns_only_the_terms_that_actually_fired() {
+        let terms = vec!["hook".to_string(), "skill".to_string()];
+
+        let fired = matching_terms(&terms, "Spent months ignoring Claude Code hooks");
+        assert_eq!(fired, vec!["hook"]);
+
+        let fired_none = matching_terms(&terms, "My game demo is on Steam");
+        assert!(fired_none.is_empty());
+
+        let fired_both = matching_terms(&terms, "a skill that wraps a hook for you");
+        assert_eq!(fired_both, vec!["hook", "skill"]);
     }
 }

@@ -52,14 +52,74 @@ pub struct TopicWithSources {
     pub source_labels: Vec<String>,
 }
 
+/// Validate + normalize a candidate topic name against bd issue drip-98u.1's
+/// deny-list, applied identically at `drip topic add` and `drip topic
+/// rename` (bd issue drip-ho5.8). Trims leading/trailing whitespace and
+/// returns the trimmed name on success.
+///
+/// **Rejected characters** (anywhere in the name): `,` `[` `]` `{` `}`,
+/// newlines, and other control characters. **Rejected leading character**:
+/// any YAML flow-sequence sigil (`&` `*` `!` `%` `@` `` ` ``) or `#`.
+/// **Reserved**: `/` (kept illegal now so path addressing stays addable
+/// later without colliding with existing names). **Normalized**: leading/
+/// trailing whitespace is trimmed; empty (or whitespace-only) after
+/// trimming is rejected. Everything else is legal -- `C++`, `Node.js`,
+/// `.NET`, and `AI & ML` all pass.
+///
+/// Two confirmed hazards drove this (drip-98u.1's resolution): the digest
+/// note's frontmatter is emitted as an UNQUOTED YAML flow sequence
+/// (`digest.rs`'s `topics: [{topics_list}]`), so `,` `[` `]` `{` `}` and a
+/// leading sigil would break Obsidian's parsing of it; and `--topic` uses
+/// clap's `value_delimiter = ','` (`cli.rs`), so a comma in a topic name is
+/// fatal a second, independent way -- it splits into two names before any
+/// lookup happens.
+pub fn validate_topic_name(name: &str) -> Result<String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("topic name must not be empty (after trimming whitespace)");
+    }
+
+    const DENY_CHARS: [char; 5] = [',', '[', ']', '{', '}'];
+    if let Some(bad) = trimmed
+        .chars()
+        .find(|c| DENY_CHARS.contains(c) || c.is_control())
+    {
+        anyhow::bail!(
+            "topic name '{trimmed}' contains a disallowed character ({bad:?}); \
+             , [ ] {{ }}, newlines, and other control characters are not allowed \
+             (the digest note's frontmatter is an unquoted YAML list, and `--topic` \
+             splits on commas)"
+        );
+    }
+
+    if trimmed.contains('/') {
+        anyhow::bail!(
+            "topic name '{trimmed}' contains '/', which is reserved for future path addressing"
+        );
+    }
+
+    const YAML_SIGILS: [char; 6] = ['&', '*', '!', '%', '@', '`'];
+    let first = trimmed.chars().next().expect("checked non-empty above");
+    if YAML_SIGILS.contains(&first) || first == '#' {
+        anyhow::bail!(
+            "topic name '{trimmed}' cannot start with '{first}' -- YAML flow-sequence sigils \
+             are reserved, since the digest note's frontmatter is emitted as an unquoted list"
+        );
+    }
+
+    Ok(trimmed.to_string())
+}
+
 /// Create a new topic named `name`. Returns its `id`.
 ///
-/// Errors clearly if `name` is already taken (enforced by `topics.name`'s
-/// `UNIQUE` constraint), mirroring `sources.rs`'s `map_label_conflict`
-/// pattern.
+/// `name` is validated + trimmed via [`validate_topic_name`] first (bd issue
+/// drip-ho5.8/drip-98u.1). Errors clearly if `name` is already taken
+/// (enforced by `topics.name`'s `UNIQUE` constraint), mirroring
+/// `sources.rs`'s `map_label_conflict` pattern.
 pub fn create_topic(conn: &Connection, name: &str) -> Result<i64> {
+    let name = validate_topic_name(name)?;
     conn.execute("INSERT INTO topics (name) VALUES (?1)", params![name])
-        .map_err(|err| map_topic_name_conflict(err, name))?;
+        .map_err(|err| map_topic_name_conflict(err, &name))?;
 
     let id: i64 = conn
         .query_row(
@@ -154,11 +214,11 @@ fn topic_id_by_name(conn: &Connection, topic_name: &str) -> Result<i64> {
 }
 
 /// Look up a topic's id by its name, for the write paths that assign a
-/// source to a topic (`drip source add`/`drip source move`, bd issue
-/// drip-38w.2). Unlike [`topic_id_by_name`] (whose error points at `drip
-/// topic list`, appropriate for a read that just needs the exact name), the
-/// fix for a missing topic here is to create it -- so the error instead
-/// points at `drip topic add`.
+/// source to a topic (`drip source add`/`drip source link`/`drip topic add
+/// --parent`, bd issue drip-38w.2/drip-ho5.8). Unlike [`topic_id_by_name`]
+/// (whose error points at `drip topic list`, appropriate for a read that
+/// just needs the exact name), the fix for a missing topic here is to
+/// create it -- so the error instead points at `drip topic add`.
 pub fn require_topic_id(conn: &Connection, name: &str) -> Result<i64> {
     let id = conn.query_row(
         "SELECT id FROM topics WHERE name = ?1",
@@ -173,6 +233,161 @@ pub fn require_topic_id(conn: &Connection, name: &str) -> Result<i64> {
         )),
         Err(err) => Err(err).with_context(|| format!("failed to look up topic '{name}'")),
     }
+}
+
+/// Create a sub-topic named `name` directly under the main topic named
+/// `parent_name` (bd issue drip-ho5.8: `drip topic add --name <n> --parent
+/// <main>`). Returns the new sub-topic's `id`.
+///
+/// `name` is validated via [`validate_topic_name`], same as [`create_topic`].
+/// `parent_name` must already exist -- an unknown parent errors via
+/// [`require_topic_id`], pointing at `drip topic add` (create the main topic
+/// first). Enforces **exactly two levels** in application code (bd issue
+/// drip-98u.7): rejects when `parent_name` is ITSELF a sub-topic (i.e.
+/// already has a non-NULL `parent_id`), since parenting under it would
+/// create a third level, which the schema doesn't represent and nothing in
+/// this codebase (rendering, classification, `--topic` expansion) expects.
+pub fn create_sub_topic(conn: &Connection, name: &str, parent_name: &str) -> Result<i64> {
+    let name = validate_topic_name(name)?;
+    let parent_id = require_topic_id(conn, parent_name)?;
+
+    let parent_parent_id: Option<i64> = conn
+        .query_row(
+            "SELECT parent_id FROM topics WHERE id = ?1",
+            params![parent_id],
+            |row| row.get(0),
+        )
+        .with_context(|| format!("failed to look up parentage for topic '{parent_name}'"))?;
+    if parent_parent_id.is_some() {
+        anyhow::bail!(
+            "'{parent_name}' is itself a sub-topic; topics are two levels deep -- pass its own \
+             main topic to --parent instead"
+        );
+    }
+
+    conn.execute(
+        "INSERT INTO topics (name, parent_id) VALUES (?1, ?2)",
+        params![name, parent_id],
+    )
+    .map_err(|err| map_topic_name_conflict(err, &name))?;
+
+    conn.query_row(
+        "SELECT id FROM topics WHERE name = ?1",
+        params![name],
+        |row| row.get(0),
+    )
+    .with_context(|| format!("failed to look up topic id for '{name}'"))
+}
+
+/// Look up the id of the topic named `name`, requiring that it be a LEAF
+/// SUB-TOPIC (bd issue drip-ho5.8, per drip-98u.7's resolution: "sources may
+/// link only to leaf sub-topics"). Used by `drip source add`/`drip source
+/// link` to reject linking a source directly to a main topic.
+///
+/// A missing name errors via [`require_topic_id`] (points at `drip topic
+/// add`, since creating it is the fix for a genuinely-missing topic). A main
+/// topic (`parent_id IS NULL`) errors with a message pointing at creating a
+/// sub-topic under it instead, since that -- not creating another main
+/// topic -- is the actionable fix here.
+pub fn require_leaf_sub_topic_id(conn: &Connection, name: &str) -> Result<i64> {
+    let id = require_topic_id(conn, name)?;
+
+    let parent_id: Option<i64> = conn
+        .query_row(
+            "SELECT parent_id FROM topics WHERE id = ?1",
+            params![id],
+            |row| row.get(0),
+        )
+        .with_context(|| format!("failed to look up parentage for topic '{name}'"))?;
+
+    if parent_id.is_none() {
+        anyhow::bail!(
+            "'{name}' is a main topic; sources link to sub-topics only -- create one with \
+             `drip topic add --name <sub-topic> --parent {name}`"
+        );
+    }
+
+    Ok(id)
+}
+
+/// Rename the topic `old_name` to `new_name` (bd issue drip-ho5.8, per
+/// drip-98u.7's resolution: `drip topic rename`). `new_name` is validated +
+/// trimmed via [`validate_topic_name`], same deny-list as [`create_topic`].
+/// A missing `old_name` errors via [`topic_id_by_name`] (points at `drip
+/// topic list`).
+///
+/// **Future-notes-only**: this updates only the DB row. It never rewrites an
+/// already-written digest note -- headings are located by exact full-line
+/// equality (`digest.rs`), so a same-day rename means the next fetch cannot
+/// find the old heading and appends a fresh one alongside it instead.
+/// Confusing but not destructive, and gone by tomorrow -- `src/main.rs`'s
+/// `handle_topic` is responsible for checking today's note and printing a
+/// warning about this ahead of calling this function, not for refusing the
+/// rename outright.
+pub fn rename_topic(conn: &Connection, old_name: &str, new_name: &str) -> Result<()> {
+    let new_name = validate_topic_name(new_name)?;
+    let topic_id = topic_id_by_name(conn, old_name)?;
+
+    conn.execute(
+        "UPDATE topics SET name = ?1 WHERE id = ?2",
+        params![new_name, topic_id],
+    )
+    .map_err(|err| map_topic_name_conflict(err, &new_name))?;
+
+    Ok(())
+}
+
+/// Reparent the sub-topic `name` to be a child of `new_parent_name` instead
+/// of its current main topic (bd issue drip-ho5.8's reparent verb, per
+/// drip-98u.7's resolution). Names are globally unique (drip-98u.1) and
+/// keyword rules live on a source's `topic_links` row, not on parentage, so
+/// this changes only which main topic's H2 `name` renders under from the
+/// next digest write onward -- existing notes are untouched (same
+/// future-notes-only posture as [`rename_topic`]; `src/main.rs`'s
+/// `handle_topic` is responsible for the "today's note already has this
+/// heading" warning).
+///
+/// Errors if `name` isn't itself a sub-topic (a main topic has no parent to
+/// move), or if `new_parent_name` isn't itself a main topic (enforces the
+/// same two-level depth cap as [`create_sub_topic`]).
+pub fn reparent_topic(conn: &Connection, name: &str, new_parent_name: &str) -> Result<()> {
+    let topic_id = topic_id_by_name(conn, name)?;
+    let current_parent_id: Option<i64> = conn
+        .query_row(
+            "SELECT parent_id FROM topics WHERE id = ?1",
+            params![topic_id],
+            |row| row.get(0),
+        )
+        .with_context(|| format!("failed to look up parentage for topic '{name}'"))?;
+    if current_parent_id.is_none() {
+        anyhow::bail!(
+            "'{name}' is a main topic, not a sub-topic; only a sub-topic can be reparented \
+             (a main topic has no parent to move)"
+        );
+    }
+
+    let new_parent_id = require_topic_id(conn, new_parent_name)?;
+    let new_parent_parent_id: Option<i64> = conn
+        .query_row(
+            "SELECT parent_id FROM topics WHERE id = ?1",
+            params![new_parent_id],
+            |row| row.get(0),
+        )
+        .with_context(|| format!("failed to look up parentage for topic '{new_parent_name}'"))?;
+    if new_parent_parent_id.is_some() {
+        anyhow::bail!(
+            "'{new_parent_name}' is itself a sub-topic; topics are two levels deep -- pass a \
+             main topic to reparent under"
+        );
+    }
+
+    conn.execute(
+        "UPDATE topics SET parent_id = ?1 WHERE id = ?2",
+        params![new_parent_id, topic_id],
+    )
+    .with_context(|| format!("failed to reparent topic '{name}'"))?;
+
+    Ok(())
 }
 
 /// Count how many sub-topics are directly parented under the topic named
@@ -229,26 +444,124 @@ fn source_by_label(conn: &Connection, source_label: &str) -> Result<SourceRow> {
         .ok_or_else(|| anyhow::anyhow!("no source named '{source_label}' (run `drip source list`)"))
 }
 
-/// Move the source labeled `source_label` to the topic named `topic_name`
-/// (bd issue drip-38w.2: backs `drip source move` -- the only way to
-/// reassign an already-saved source to a different topic now that every
-/// source belongs to EXACTLY ONE topic, tracked by `sources.topic_id`).
+/// Declaratively (re)configure the link between the source labeled
+/// `source_label` and the topic named `topic_name` (bd issue drip-ho5.8:
+/// backs `drip source link`, replacing the removed `drip source move` --
+/// `topics::move_source_to_topic`/`sources::set_source_topic` expressed
+/// one-topic-per-source and no longer make sense now that a source can link
+/// into several sub-topics at once).
 ///
-/// Errors clearly if either the topic or the source doesn't exist -- an
-/// unknown topic points at `drip topic add` (via [`require_topic_id`]) since
-/// that's the actionable fix here, not `drip topic list`. Calling this again
-/// for a source already in `topic_name` is a harmless no-op --
-/// `sources::set_source_topic`'s `UPDATE` just sets the same value again.
-pub fn move_source_to_topic(conn: &Connection, topic_name: &str, source_label: &str) -> Result<()> {
+/// `match_terms`/`exclude_terms` REPLACE this link's entire include/exclude
+/// lists wholesale, and `match_body` replaces its per-link body-matching
+/// flag -- the "declarative upsert" decision on drip-98u.8: re-running this
+/// with the same arguments is idempotent and produces identical state, which
+/// is what makes a shell script the reproducible way to author a source's
+/// rule set. Creates the `topic_links` row if it doesn't exist yet.
+///
+/// Never touches `seen_items` -- this is plain INSERT/DELETE/UPDATE against
+/// `topic_links`/`link_rules`, not a remove-and-re-add of the source itself
+/// (drip-98u.8's decisive "editing rules never resets dedup" argument).
+///
+/// Errors clearly if either the source or the topic doesn't exist -- an
+/// unknown topic points at `drip topic add` (via [`require_topic_id`]), an
+/// unknown source at `drip source list` (via [`source_by_label`]).
+/// Leaf-only enforcement ("sources link to sub-topics only") is NOT done
+/// here -- see [`require_leaf_sub_topic_id`], which `src/main.rs`'s
+/// `handle_source` calls ahead of this for the real CLI path; this function
+/// stays a permissive data-layer primitive so test fixtures elsewhere in
+/// this codebase can still link directly into a bare (pre-hierarchy) topic.
+pub fn link_source_to_topic(
+    conn: &Connection,
+    source_label: &str,
+    topic_name: &str,
+    match_terms: &[String],
+    exclude_terms: &[String],
+    match_body: bool,
+) -> Result<()> {
+    let source = source_by_label(conn, source_label)?;
     let topic_id = require_topic_id(conn, topic_name)?;
-    // Confirm the source itself exists first, so an unknown `source_label`
-    // gets the same clear "no source named ... (run `drip source list`)"
-    // message this always had, rather than whatever `set_source_topic`'s own
-    // (equally clear, but not previously exercised via this path) message
-    // happens to say.
-    source_by_label(conn, source_label)?;
 
-    sources::set_source_topic(conn, source_label, topic_id)
+    conn.execute(
+        "INSERT INTO topic_links (source_id, topic_id, match_body) VALUES (?1, ?2, ?3) \
+         ON CONFLICT(source_id, topic_id) DO UPDATE SET match_body = excluded.match_body",
+        params![source.id, topic_id, match_body as i64],
+    )
+    .with_context(|| format!("failed to link source '{source_label}' to topic '{topic_name}'"))?;
+
+    let link_id: i64 = conn
+        .query_row(
+            "SELECT id FROM topic_links WHERE source_id = ?1 AND topic_id = ?2",
+            params![source.id, topic_id],
+            |row| row.get(0),
+        )
+        .with_context(|| {
+            format!("failed to look up link id for source '{source_label}' / topic '{topic_name}'")
+        })?;
+
+    replace_link_rules(conn, link_id, "include", match_terms)?;
+    replace_link_rules(conn, link_id, "exclude", exclude_terms)?;
+
+    Ok(())
+}
+
+/// Replace every `link_rules` row of `role` ("include"/"exclude") belonging
+/// to `link_id` with exactly `terms` -- the declarative-replace half of
+/// [`link_source_to_topic`]. A plain DELETE-then-INSERT, per `link_id`+
+/// `role` pair, so re-running with the same `terms` is idempotent (the
+/// `UNIQUE (link_id, role, term)` constraint would reject a literal
+/// re-insert otherwise, but the DELETE ahead of it means there's nothing
+/// left to conflict with).
+fn replace_link_rules(conn: &Connection, link_id: i64, role: &str, terms: &[String]) -> Result<()> {
+    conn.execute(
+        "DELETE FROM link_rules WHERE link_id = ?1 AND role = ?2",
+        params![link_id, role],
+    )
+    .with_context(|| format!("failed to clear existing '{role}' rules for link id {link_id}"))?;
+
+    for term in terms {
+        conn.execute(
+            "INSERT INTO link_rules (link_id, role, term) VALUES (?1, ?2, ?3)",
+            params![link_id, role, term],
+        )
+        .with_context(|| {
+            format!("failed to insert '{role}' rule '{term}' for link id {link_id}")
+        })?;
+    }
+
+    Ok(())
+}
+
+/// Remove the link between the source labeled `source_label` and the topic
+/// named `topic_name` (bd issue drip-ho5.8: backs `drip source unlink`).
+/// `link_rules.link_id` is `ON DELETE CASCADE` (migration 0006), so this
+/// also removes every rule that belonged to the link -- there is no
+/// independent way to keep a rule around once its link is gone. Returns
+/// `true` if a link existed and was removed, `false` if the two were never
+/// linked (a benign no-op, matching [`remove_topic`]/`sources::remove_by_label`'s
+/// own "already gone is a success state" convention).
+///
+/// Errors clearly if either the source or the topic doesn't exist -- both
+/// point at their respective `list` command, since there's nothing to
+/// create here (unlike [`link_source_to_topic`]'s topic side, where an
+/// unknown name points at `drip topic add`).
+pub fn unlink_source_from_topic(
+    conn: &Connection,
+    source_label: &str,
+    topic_name: &str,
+) -> Result<bool> {
+    let source = source_by_label(conn, source_label)?;
+    let topic_id = topic_id_by_name(conn, topic_name)?;
+
+    let changed = conn
+        .execute(
+            "DELETE FROM topic_links WHERE source_id = ?1 AND topic_id = ?2",
+            params![source.id, topic_id],
+        )
+        .with_context(|| {
+            format!("failed to unlink source '{source_label}' from topic '{topic_name}'")
+        })?;
+
+    Ok(changed > 0)
 }
 
 /// List every topic, grouped into the two-level tree (bd issue drip-ho5.4,
@@ -274,9 +587,9 @@ pub fn move_source_to_topic(conn: &Connection, topic_name: &str, source_label: &
 /// now-dead `sources.topic_id` column (previously bd issue drip-38w.1) or
 /// the even-older-inert `topic_sources` join. Unlabeled member sources
 /// (there shouldn't be any -- every source that gets linked also went
-/// through `sources::upsert_source`/`set_source_topic`, both of which are
-/// only ever called with an already-labeled source in this codebase -- but
-/// defensively) are excluded from `source_labels`, matching `sources::list`'s
+/// through `sources::upsert_source`/[`link_source_to_topic`], both of which
+/// are only ever called with an already-labeled source in this codebase --
+/// but defensively) are excluded from `source_labels`, matching `sources::list`'s
 /// own `display_name IS NOT NULL` convention.
 pub fn list_topics(conn: &Connection) -> Result<Vec<TopicWithSources>> {
     // Ordering: group by each row's main-topic name (a main topic's own
@@ -583,6 +896,100 @@ mod tests {
         assert!(listed_after.is_empty());
     }
 
+    // -- Cycle 1 (bd issue drip-ho5.8, per drip-98u.1's deny-list): topic
+    // name validation, applied at `topic add`/`topic rename` via
+    // `validate_topic_name`.
+
+    #[test]
+    fn validate_topic_name_trims_whitespace() {
+        let name = validate_topic_name("  rust  ").expect("should trim and accept");
+        assert_eq!(name, "rust");
+    }
+
+    #[test]
+    fn validate_topic_name_rejects_empty_after_trimming() {
+        let err = validate_topic_name("   ").expect_err("whitespace-only name should be rejected");
+        assert!(err.to_string().contains("empty"));
+    }
+
+    #[test]
+    fn validate_topic_name_rejects_a_comma() {
+        // The decisive case (drip-98u.1): `--topic` uses clap's
+        // `value_delimiter = ','` (cli.rs), so a comma in a topic name is
+        // fatal twice over -- once via unquoted YAML frontmatter
+        // (digest.rs:253/`topics: [{topics_list}]`), once via `--topic`
+        // itself splitting on it before any lookup happens.
+        let err = validate_topic_name("Rust, News").expect_err("a comma should be rejected");
+        assert!(
+            err.to_string().contains(','),
+            "error should mention the offending character: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_topic_name_rejects_yaml_flow_sequence_characters() {
+        for bad in ["a[b", "a]b", "a{b", "a}b"] {
+            validate_topic_name(bad).expect_err(&format!("{bad:?} should be rejected"));
+        }
+    }
+
+    #[test]
+    fn validate_topic_name_rejects_control_characters_and_newlines() {
+        validate_topic_name("a\nb").expect_err("a newline should be rejected");
+        validate_topic_name("a\tb").expect_err("a control character should be rejected");
+    }
+
+    #[test]
+    fn validate_topic_name_rejects_a_leading_yaml_sigil() {
+        for bad in [
+            "&anchor",
+            "*alias",
+            "!tag",
+            "%directive",
+            "@flow",
+            "`code",
+            "#comment",
+        ] {
+            validate_topic_name(bad).expect_err(&format!(
+                "a name starting with a YAML sigil ({bad:?}) should be rejected"
+            ));
+        }
+    }
+
+    #[test]
+    fn validate_topic_name_reserves_the_forward_slash() {
+        let err = validate_topic_name("AI engineering/news")
+            .expect_err("a forward slash should be rejected (reserved for future path addressing)");
+        assert!(err.to_string().contains('/'));
+    }
+
+    #[test]
+    fn validate_topic_name_allows_everything_else() {
+        for ok in [
+            "C++",
+            "Node.js",
+            ".NET",
+            "AI & ML",
+            "rust",
+            "AI engineering",
+        ] {
+            validate_topic_name(ok).unwrap_or_else(|err| panic!("{ok:?} should be legal: {err}"));
+        }
+    }
+
+    #[test]
+    fn create_topic_rejects_an_invalid_name() {
+        let (_dir, conn) = fresh_conn();
+
+        let err = create_topic(&conn, "a,b").expect_err("an invalid name should be rejected");
+        assert!(err.to_string().contains(','));
+
+        assert!(
+            list_topics(&conn).unwrap().is_empty(),
+            "a rejected create must not leave a partial row behind"
+        );
+    }
+
     #[test]
     fn create_topic_with_taken_name_errors_clearly() {
         let (_dir, conn) = fresh_conn();
@@ -601,16 +1008,25 @@ mod tests {
         );
     }
 
+    // -- bd issue drip-ho5.8: `link_source_to_topic`/`unlink_source_from_topic`
+    // replace `move_source_to_topic`/`sources::set_source_topic` (removed --
+    // they expressed one-topic-per-source, which is no longer a thing a
+    // source can even be under many-to-many `topic_links`). Reassignment is
+    // now unlink-then-link rather than a single wholesale "move".
+
     #[test]
-    fn move_source_to_topic_reassigns_it_and_appears_in_list_and_sources_for_topic() {
+    fn link_then_unlink_reassigns_a_source_between_topics() {
         let (_dir, conn) = fresh_conn();
 
         let tid_other = create_topic(&conn, "other").expect("create_topic should succeed");
         create_topic(&conn, "rust").expect("create_topic should succeed");
         make_source(&conn, tid_other, "rust-blog");
 
-        move_source_to_topic(&conn, "rust", "rust-blog")
-            .expect("move_source_to_topic should succeed");
+        link_source_to_topic(&conn, "rust-blog", "rust", &[], &[], false)
+            .expect("link_source_to_topic should succeed");
+        let unlinked = unlink_source_from_topic(&conn, "rust-blog", "other")
+            .expect("unlink_source_from_topic should succeed");
+        assert!(unlinked);
 
         let listed = list_topics(&conn).expect("list_topics should succeed");
         assert_eq!(
@@ -628,12 +1044,12 @@ mod tests {
     }
 
     #[test]
-    fn move_source_to_topic_errors_clearly_when_topic_missing() {
+    fn link_source_to_topic_errors_clearly_when_topic_missing() {
         let (_dir, conn) = fresh_conn();
         let tid_home = create_topic(&conn, "home").expect("create_topic should succeed");
         make_source(&conn, tid_home, "rust-blog");
 
-        let err = move_source_to_topic(&conn, "does-not-exist", "rust-blog")
+        let err = link_source_to_topic(&conn, "rust-blog", "does-not-exist", &[], &[], false)
             .expect_err("missing topic should error");
         let message = err.to_string();
         assert!(message.contains("does-not-exist"));
@@ -641,11 +1057,11 @@ mod tests {
     }
 
     #[test]
-    fn move_source_to_topic_errors_clearly_when_source_missing() {
+    fn link_source_to_topic_errors_clearly_when_source_missing() {
         let (_dir, conn) = fresh_conn();
         create_topic(&conn, "rust").expect("create_topic should succeed");
 
-        let err = move_source_to_topic(&conn, "rust", "does-not-exist")
+        let err = link_source_to_topic(&conn, "does-not-exist", "rust", &[], &[], false)
             .expect_err("missing source should error");
         let message = err.to_string();
         assert!(message.contains("does-not-exist"));
@@ -653,34 +1069,166 @@ mod tests {
     }
 
     #[test]
-    fn moving_a_source_to_its_current_topic_twice_is_a_no_op() {
+    fn linking_a_source_to_the_same_topic_twice_is_idempotent_not_a_duplicate() {
         let (_dir, conn) = fresh_conn();
 
         let tid_home = create_topic(&conn, "home").expect("create_topic should succeed");
         create_topic(&conn, "rust").expect("create_topic should succeed");
         make_source(&conn, tid_home, "rust-blog");
 
-        move_source_to_topic(&conn, "rust", "rust-blog").expect("first move should succeed");
-        move_source_to_topic(&conn, "rust", "rust-blog")
-            .expect("second move should succeed as a no-op");
+        link_source_to_topic(
+            &conn,
+            "rust-blog",
+            "rust",
+            &["hook".to_string()],
+            &[],
+            false,
+        )
+        .expect("first link should succeed");
+        link_source_to_topic(
+            &conn,
+            "rust-blog",
+            "rust",
+            &["hook".to_string()],
+            &[],
+            false,
+        )
+        .expect("second, identical link should succeed as a no-op");
 
         let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM sources", [], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM topic_links", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(count, 1, "no duplicate source row should be created");
+        assert_eq!(
+            count, 2,
+            "one link into 'home' (from make_source) plus one into 'rust' -- no duplicate row \
+             for re-running the same 'rust' link twice"
+        );
 
         let found = sources::find_by_label(&conn, "rust-blog")
             .unwrap()
             .expect("source should exist");
-
-        // `SourceRow` no longer carries topic membership (bd issue
-        // drip-ho5.3) -- assert via `list_with_topics` instead.
         let listed = sources::list_with_topics(&conn).expect("list_with_topics should succeed");
         let listed_source = listed
             .iter()
             .find(|s| s.source.id == found.id)
             .expect("source should be in list_with_topics() output");
-        assert_eq!(listed_source.topics, vec!["rust".to_string()]);
+        assert_eq!(
+            listed_source.topics,
+            vec!["home".to_string(), "rust".to_string()]
+        );
+    }
+
+    #[test]
+    fn link_source_to_topic_replaces_the_include_and_exclude_lists_wholesale() {
+        let (_dir, conn) = fresh_conn();
+        let tid = create_topic(&conn, "rust").expect("create_topic should succeed");
+        make_source(&conn, tid, "rust-blog");
+
+        link_source_to_topic(
+            &conn,
+            "rust-blog",
+            "rust",
+            &["hook".to_string(), "skill".to_string()],
+            &["pricing".to_string()],
+            false,
+        )
+        .expect("first link should succeed");
+
+        // Re-running with a DIFFERENT --match list must REPLACE, not append.
+        link_source_to_topic(
+            &conn,
+            "rust-blog",
+            "rust",
+            &["agent".to_string()],
+            &[],
+            true,
+        )
+        .expect("second link should succeed and replace the rule set");
+
+        let source_id = sources::find_by_label(&conn, "rust-blog")
+            .unwrap()
+            .unwrap()
+            .id;
+        let candidates = candidates_for_source(&conn, source_id, None)
+            .expect("candidates_for_source should succeed");
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].rules.include, vec!["agent".to_string()]);
+        assert!(
+            candidates[0].rules.exclude.is_empty(),
+            "the old exclude term should have been replaced away, not kept alongside the new one"
+        );
+        assert!(candidates[0].match_body);
+    }
+
+    #[test]
+    fn unlink_source_from_topic_cascades_its_rules() {
+        let (_dir, conn) = fresh_conn();
+        let tid = create_topic(&conn, "rust").expect("create_topic should succeed");
+        make_source(&conn, tid, "rust-blog");
+        link_source_to_topic(
+            &conn,
+            "rust-blog",
+            "rust",
+            &["hook".to_string()],
+            &[],
+            false,
+        )
+        .expect("link should succeed");
+
+        let unlinked =
+            unlink_source_from_topic(&conn, "rust-blog", "rust").expect("unlink should succeed");
+        assert!(unlinked);
+
+        let link_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM topic_links", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(link_count, 0);
+        let rule_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM link_rules", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            rule_count, 0,
+            "the link's rules should be cascade-deleted along with it"
+        );
+
+        // The source itself, and the topic, must survive.
+        assert!(sources::find_by_label(&conn, "rust-blog")
+            .unwrap()
+            .is_some());
+        assert!(list_topics(&conn).unwrap().iter().any(|t| t.name == "rust"));
+    }
+
+    #[test]
+    fn unlink_source_from_topic_is_a_benign_no_op_when_never_linked() {
+        let (_dir, conn) = fresh_conn();
+        let tid = create_topic(&conn, "rust").expect("create_topic should succeed");
+        create_topic(&conn, "other").expect("create_topic should succeed");
+        make_source(&conn, tid, "rust-blog");
+
+        let unlinked = unlink_source_from_topic(&conn, "rust-blog", "other")
+            .expect("unlinking a never-linked pair should succeed");
+        assert!(!unlinked);
+    }
+
+    #[test]
+    fn unlink_source_from_topic_errors_clearly_when_topic_missing() {
+        let (_dir, conn) = fresh_conn();
+        let tid = create_topic(&conn, "rust").expect("create_topic should succeed");
+        make_source(&conn, tid, "rust-blog");
+
+        let err = unlink_source_from_topic(&conn, "rust-blog", "does-not-exist")
+            .expect_err("missing topic should error");
+        assert!(err.to_string().contains("does-not-exist"));
+    }
+
+    #[test]
+    fn unlink_source_from_topic_errors_clearly_when_source_missing() {
+        let (_dir, conn) = fresh_conn();
+        create_topic(&conn, "rust").expect("create_topic should succeed");
+
+        let err = unlink_source_from_topic(&conn, "does-not-exist", "rust")
+            .expect_err("missing source should error");
+        assert!(err.to_string().contains("does-not-exist"));
     }
 
     // -- Cycle B (bd issue drip-ho5.4): `topic_source_count` replaced by a
@@ -709,7 +1257,9 @@ mod tests {
             0
         );
 
-        move_source_to_topic(&conn, "other", "rust-blog").expect("move should succeed");
+        unlink_source_from_topic(&conn, "rust-blog", "rust").expect("unlink should succeed");
+        link_source_to_topic(&conn, "rust-blog", "other", &[], &[], false)
+            .expect("link should succeed");
         assert_eq!(
             topic_link_count(&conn, "rust").expect("topic_link_count should succeed"),
             0
@@ -790,6 +1340,191 @@ mod tests {
         assert!(err.to_string().contains("drip topic list"));
     }
 
+    // -- Cycle 2 (bd issue drip-ho5.8, per drip-98u.7's resolution):
+    // `create_sub_topic` (`topic add --parent`) enforces two-level depth in
+    // application code; `require_leaf_sub_topic_id` enforces leaf-only
+    // source attachment.
+
+    #[test]
+    fn create_sub_topic_creates_it_parented_under_the_named_main_topic() {
+        let (_dir, conn) = fresh_conn();
+        let tid_claude = create_topic(&conn, "Claude").expect("create_topic should succeed");
+
+        let sub_id = create_sub_topic(&conn, "cc hooks", "Claude")
+            .expect("creating a sub-topic under an existing main topic should succeed");
+
+        let listed = list_topics(&conn).expect("list_topics should succeed");
+        let sub = find_topic(&listed, "cc hooks");
+        assert_eq!(sub.parent_name, Some("Claude".to_string()));
+        assert_ne!(sub_id, tid_claude);
+    }
+
+    #[test]
+    fn create_sub_topic_validates_its_own_name() {
+        let (_dir, conn) = fresh_conn();
+        create_topic(&conn, "Claude").expect("create_topic should succeed");
+
+        let err = create_sub_topic(&conn, "a,b", "Claude")
+            .expect_err("an invalid sub-topic name should be rejected");
+        assert!(err.to_string().contains(','));
+    }
+
+    #[test]
+    fn create_sub_topic_errors_clearly_when_parent_missing() {
+        let (_dir, conn) = fresh_conn();
+
+        let err = create_sub_topic(&conn, "cc hooks", "does-not-exist")
+            .expect_err("a missing parent topic should error");
+        let message = err.to_string();
+        assert!(message.contains("does-not-exist"));
+        assert!(message.contains("drip topic add"));
+    }
+
+    #[test]
+    fn create_sub_topic_rejects_a_parent_that_is_itself_a_sub_topic() {
+        let (_dir, conn) = fresh_conn();
+        let tid_claude = create_topic(&conn, "Claude").expect("create_topic should succeed");
+        make_sub_topic(&conn, tid_claude, "Claude (general)");
+
+        let err = create_sub_topic(&conn, "third level", "Claude (general)").expect_err(
+            "naming a sub-topic as the --parent should be rejected -- topics are two levels deep",
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains("Claude (general)"),
+            "error should name the offending parent: {message}"
+        );
+        assert!(
+            message.to_lowercase().contains("two level")
+                || message.to_lowercase().contains("sub-topic"),
+            "error should explain the two-level depth cap: {message}"
+        );
+    }
+
+    #[test]
+    fn require_leaf_sub_topic_id_accepts_a_sub_topic() {
+        let (_dir, conn) = fresh_conn();
+        let tid_claude = create_topic(&conn, "Claude").expect("create_topic should succeed");
+        let tid_sub = make_sub_topic(&conn, tid_claude, "cc hooks");
+
+        let id = require_leaf_sub_topic_id(&conn, "cc hooks")
+            .expect("a genuine sub-topic should be accepted");
+        assert_eq!(id, tid_sub);
+    }
+
+    #[test]
+    fn require_leaf_sub_topic_id_rejects_a_main_topic() {
+        let (_dir, conn) = fresh_conn();
+        create_topic(&conn, "Claude").expect("create_topic should succeed");
+
+        let err = require_leaf_sub_topic_id(&conn, "Claude")
+            .expect_err("a main topic should be rejected as a link target");
+        let message = err.to_string();
+        assert!(message.contains("Claude"));
+        assert!(
+            message.contains("drip topic add"),
+            "error should point at creating a sub-topic: {message}"
+        );
+    }
+
+    #[test]
+    fn require_leaf_sub_topic_id_errors_clearly_when_missing() {
+        let (_dir, conn) = fresh_conn();
+
+        let err = require_leaf_sub_topic_id(&conn, "does-not-exist")
+            .expect_err("a missing topic should error");
+        assert!(err.to_string().contains("does-not-exist"));
+    }
+
+    // -- Cycle 3 (bd issue drip-ho5.8, per drip-98u.7's resolution): `drip
+    // topic rename`/the reparent verb, both re-validating against
+    // drip-98u.1's deny-list.
+
+    #[test]
+    fn rename_topic_updates_the_name_and_preserves_membership() {
+        let (_dir, conn) = fresh_conn();
+        let tid_claude = create_topic(&conn, "Claude").expect("create_topic should succeed");
+        let tid_sub = make_sub_topic(&conn, tid_claude, "loop engineering");
+        make_source(&conn, tid_sub, "s1");
+
+        rename_topic(&conn, "loop engineering", "agent loops").expect("rename should succeed");
+
+        let listed = list_topics(&conn).expect("list_topics should succeed");
+        assert!(
+            !listed.iter().any(|t| t.name == "loop engineering"),
+            "the old name should no longer exist"
+        );
+        let renamed = find_topic(&listed, "agent loops");
+        assert_eq!(renamed.parent_name, Some("Claude".to_string()));
+        assert_eq!(renamed.source_labels, vec!["s1".to_string()]);
+    }
+
+    #[test]
+    fn rename_topic_validates_the_new_name() {
+        let (_dir, conn) = fresh_conn();
+        create_topic(&conn, "Claude").expect("create_topic should succeed");
+
+        let err = rename_topic(&conn, "Claude", "a,b")
+            .expect_err("an invalid new name should be rejected");
+        assert!(err.to_string().contains(','));
+
+        // Nothing should have been renamed.
+        let listed = list_topics(&conn).expect("list_topics should succeed");
+        assert!(listed.iter().any(|t| t.name == "Claude"));
+    }
+
+    #[test]
+    fn rename_topic_errors_clearly_when_old_name_missing() {
+        let (_dir, conn) = fresh_conn();
+
+        let err = rename_topic(&conn, "does-not-exist", "new-name")
+            .expect_err("a missing topic should error");
+        assert!(err.to_string().contains("does-not-exist"));
+    }
+
+    #[test]
+    fn reparent_topic_moves_a_sub_topic_under_a_different_main() {
+        let (_dir, conn) = fresh_conn();
+        let tid_claude = create_topic(&conn, "Claude").expect("create_topic should succeed");
+        let tid_rust = create_topic(&conn, "Rust").expect("create_topic should succeed");
+        make_sub_topic(&conn, tid_claude, "cc hooks");
+
+        reparent_topic(&conn, "cc hooks", "Rust").expect("reparent should succeed");
+
+        let listed = list_topics(&conn).expect("list_topics should succeed");
+        assert_eq!(
+            find_topic(&listed, "cc hooks").parent_name,
+            Some("Rust".to_string())
+        );
+        assert_eq!(topic_child_count(&conn, "Claude").unwrap(), 0);
+        assert_eq!(topic_child_count(&conn, "Rust").unwrap(), 1);
+        let _ = tid_rust;
+    }
+
+    #[test]
+    fn reparent_topic_rejects_a_main_topic_as_the_thing_being_moved() {
+        let (_dir, conn) = fresh_conn();
+        create_topic(&conn, "Claude").expect("create_topic should succeed");
+        create_topic(&conn, "Rust").expect("create_topic should succeed");
+
+        let err = reparent_topic(&conn, "Claude", "Rust")
+            .expect_err("a main topic has no parent to move");
+        assert!(err.to_string().contains("Claude"));
+    }
+
+    #[test]
+    fn reparent_topic_rejects_a_new_parent_that_is_itself_a_sub_topic() {
+        let (_dir, conn) = fresh_conn();
+        let tid_claude = create_topic(&conn, "Claude").expect("create_topic should succeed");
+        let tid_rust = create_topic(&conn, "Rust").expect("create_topic should succeed");
+        make_sub_topic(&conn, tid_claude, "cc hooks");
+        make_sub_topic(&conn, tid_rust, "rust news");
+
+        let err = reparent_topic(&conn, "cc hooks", "rust news")
+            .expect_err("reparenting under a sub-topic should be rejected -- two levels only");
+        assert!(err.to_string().contains("rust news"));
+    }
+
     #[test]
     fn require_topic_id_errors_clearly_when_topic_missing() {
         let (_dir, conn) = fresh_conn();
@@ -829,12 +1564,16 @@ mod tests {
         remove_topic(&conn, "rust")
             .expect_err("removing a topic that still owns a source should fail (FK RESTRICT)");
 
-        // Once the source is moved elsewhere, the now-empty topic can be
-        // removed, and the source itself survives (removing a topic never
-        // deletes the sources that were in it).
+        // Once the source is moved elsewhere (unlink-then-link, since a
+        // wholesale "move" primitive no longer exists under many-to-many
+        // links), the now-empty topic can be removed, and the source itself
+        // survives (removing a topic never deletes the sources that were in
+        // it).
         create_topic(&conn, "other").expect("create_topic should succeed");
-        move_source_to_topic(&conn, "other", "rust-blog")
-            .expect("moving the source out of 'rust' should succeed");
+        unlink_source_from_topic(&conn, "rust-blog", "rust")
+            .expect("unlinking the source from 'rust' should succeed");
+        link_source_to_topic(&conn, "rust-blog", "other", &[], &[], false)
+            .expect("linking the source into 'other' should succeed");
         let removed = remove_topic(&conn, "rust").expect("removing an empty topic should succeed");
         assert!(removed);
 
