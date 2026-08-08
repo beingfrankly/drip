@@ -123,34 +123,4 @@ impl SourceKind {
             _ => None,
         }
     }
-
-    /// Whether this source kind should get Reddit-specific *rendering*
-    /// treatment in digest/journal output: `r/{name}` headings and labels
-    /// (see [`SourceKind::heading_prefix`]), a `u/{name}` author prefix, and
-    /// a `reddit/{name}` tag. This is the single source of truth for that
-    /// decision (bd issue drip-p6v.4) -- `src/digest.rs` and
-    /// `src/journal.rs` call this (directly, or via
-    /// [`SourceKind::heading_prefix`]) instead of each re-deriving
-    /// `kind == SourceKind::Reddit` at their own rendering call sites.
-    ///
-    /// Not to be confused with `src/main.rs`'s exhaustive
-    /// `match source_row.kind { .. }` fetch dispatch (bd issue drip-p6v.1) --
-    /// that's a different concern (which fetcher to call), left untouched
-    /// by this method.
-    pub fn is_reddit(&self) -> bool {
-        matches!(self, SourceKind::Reddit)
-    }
-
-    /// `name` rendered with this kind's display-label convention: `r/{name}`
-    /// for Reddit-origin groups (matching Reddit's own subreddit naming),
-    /// bare `{name}` for everything else. Used by `src/digest.rs`'s header
-    /// summary line and per-group heading, and by `src/journal.rs`'s digest
-    /// bullet -- all three want exactly the same `r/`-vs-bare choice.
-    pub fn heading_prefix(&self, name: &str) -> String {
-        if self.is_reddit() {
-            format!("r/{name}")
-        } else {
-            name.to_string()
-        }
-    }
 }

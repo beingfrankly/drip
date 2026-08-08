@@ -13,6 +13,8 @@
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
 
+use crate::classify::{Candidate, Section};
+use crate::rules::RuleSet;
 use crate::sources::{self, SourceRow};
 use crate::types::SourceKind;
 
@@ -387,6 +389,134 @@ pub fn sources_for_topic(conn: &Connection, topic_name: &str) -> Result<Vec<Sour
 
     rows.collect::<rusqlite::Result<Vec<_>>>()
         .with_context(|| format!("failed to list member sources for topic '{topic_name}'"))
+}
+
+/// The set of sub-topic ids "requested" by naming `topic_name` in a `drip
+/// fetch --topic` invocation (bd issue drip-98u.3's "candidate set = only the
+/// requested sub-topics' rules" decision, implemented by bd issue drip-ho5.6):
+/// `topic_name`'s own id, plus every topic directly parented under it. For a
+/// sub-topic this is just its own id (a sub-topic has no children under the
+/// two-level depth cap); for a main topic it's every one of its sub-topics'
+/// ids (plus the main's own id, covering a legacy pre-hierarchy topic that
+/// still has a direct link -- see [`sources_for_topic`]'s doc comment for the
+/// same case). Deliberately mirrors [`sources_for_topic`]'s own `tl.topic_id
+/// = ?1 OR tl.topic_id IN (children)` matching set, so "which sources does
+/// `--topic X` fetch" and "which sub-topics does `--topic X` request
+/// classification against" never disagree. Errors clearly if no topic has
+/// that name.
+pub fn requested_sub_topic_ids(conn: &Connection, topic_name: &str) -> Result<Vec<i64>> {
+    let topic_id = topic_id_by_name(conn, topic_name)?;
+
+    let mut stmt = conn
+        .prepare("SELECT id FROM topics WHERE id = ?1 OR parent_id = ?1")
+        .context("failed to prepare requested sub-topic ids query")?;
+
+    let ids = stmt
+        .query_map(params![topic_id], |row| row.get::<_, i64>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .with_context(|| format!("failed to list requested sub-topic ids for '{topic_name}'"))?;
+
+    Ok(ids)
+}
+
+/// Load `source_id`'s classification [`Candidate`]s from `topic_links`
+/// (joined with `link_rules` and the linked topic's own name/parent), for
+/// `classify::classify_items` to route the source's freshly-fetched items
+/// into `(main topic, sub-topic)` sections (bd issue drip-ho5.6).
+///
+/// `requested_sub_topic_ids`, when `Some`, restricts the candidate set to
+/// only the links whose `topic_id` is in that list -- bd issue drip-98u.3's
+/// "candidates are only the REQUESTED sub-topics' rules" decision, which
+/// applies when the caller resolved this source via `drip fetch --topic
+/// <name>` (see [`requested_sub_topic_ids`]). `None` means no topic scoping
+/// was requested (a direct `drip fetch --source`/`--all`), so every one of
+/// the source's links is a candidate.
+///
+/// A linked topic with no parent (`parent_id IS NULL`) is treated as both its
+/// own main topic AND its own sub-topic -- the legacy/pre-hierarchy case of a
+/// topic linked to directly rather than through a two-level tree (see
+/// `sources_for_topic`'s doc comment, and every pre-drip-ho5.8 `drip source
+/// add --topic <name>` call, which links straight into a topic with no
+/// concept of sub-topics yet).
+pub fn candidates_for_source(
+    conn: &Connection,
+    source_id: i64,
+    requested_sub_topic_ids: Option<&[i64]>,
+) -> Result<Vec<Candidate>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT tl.id, tl.topic_id, tl.match_body, t.name, p.name \
+             FROM topic_links tl \
+             JOIN topics t ON t.id = tl.topic_id \
+             LEFT JOIN topics p ON p.id = t.parent_id \
+             WHERE tl.source_id = ?1 \
+             ORDER BY t.name",
+        )
+        .context("failed to prepare classification candidates query")?;
+
+    let links: Vec<(i64, i64, bool, String, Option<String>)> = stmt
+        .query_map(params![source_id], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get::<_, i64>(2)? != 0,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .with_context(|| format!("failed to list topic links for source id {source_id}"))?;
+
+    let mut candidates = Vec::with_capacity(links.len());
+    for (link_id, topic_id, match_body, sub_topic, parent_name) in links {
+        if let Some(ids) = requested_sub_topic_ids {
+            if !ids.contains(&topic_id) {
+                continue;
+            }
+        }
+        let main_topic = parent_name.unwrap_or_else(|| sub_topic.clone());
+        let rules = load_link_rules(conn, link_id)?;
+        candidates.push(Candidate {
+            section: Section {
+                main_topic,
+                sub_topic,
+            },
+            rules,
+            match_body,
+        });
+    }
+
+    Ok(candidates)
+}
+
+/// Load one `topic_links` row's include/exclude rules from `link_rules`, for
+/// [`candidates_for_source`].
+fn load_link_rules(conn: &Connection, link_id: i64) -> Result<RuleSet> {
+    let mut stmt = conn
+        .prepare("SELECT role, term FROM link_rules WHERE link_id = ?1")
+        .context("failed to prepare link rules query")?;
+
+    let rows: Vec<(String, String)> = stmt
+        .query_map(params![link_id], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .with_context(|| format!("failed to list rules for link id {link_id}"))?;
+
+    let mut include = Vec::new();
+    let mut exclude = Vec::new();
+    for (role, term) in rows {
+        match role.as_str() {
+            "include" => include.push(term),
+            "exclude" => exclude.push(term),
+            other => {
+                // `link_rules.role`'s CHECK constraint (migrations/0006) only
+                // allows 'include'/'exclude' -- anything else would mean the
+                // DB itself is inconsistent, not a normal runtime condition.
+                anyhow::bail!("unrecognized link_rules.role value '{other}' for link id {link_id}")
+            }
+        }
+    }
+
+    Ok(RuleSet { include, exclude })
 }
 
 #[cfg(test)]

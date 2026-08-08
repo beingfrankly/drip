@@ -256,6 +256,26 @@ pub fn topic_names_for_source(conn: &Connection, source_id: i64) -> Result<Vec<S
     Ok(names)
 }
 
+/// The title-only exclude terms configured for `source_id` in
+/// `source_excludes` (`migrations/0006_topic_tree.sql`) -- the pre-filter
+/// `classify::classify_item` rejects an item with, before any candidate
+/// sub-topic routing runs (bd issue drip-98u.3, loaded here for bd issue
+/// drip-ho5.6's pipeline). Empty when the source has none configured, which
+/// is the common case today (bd issue drip-ho5.8 owns the CLI to author
+/// these; nothing writes to `source_excludes` yet).
+pub fn source_excludes(conn: &Connection, source_id: i64) -> Result<Vec<String>> {
+    let mut stmt = conn
+        .prepare("SELECT term FROM source_excludes WHERE source_id = ?1")
+        .context("failed to prepare source_excludes query")?;
+
+    let terms = stmt
+        .query_map(params![source_id], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .with_context(|| format!("failed to list source_excludes for source id {source_id}"))?;
+
+    Ok(terms)
+}
+
 /// [`list`] every labeled source, each paired with the names of every
 /// sub-topic it's linked into (via [`topic_names_for_source`]), sorted --
 /// backs `drip source list` (bd issue drip-ho5.3). Mirrors `src/topics.rs`'s

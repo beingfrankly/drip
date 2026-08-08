@@ -25,6 +25,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 use rusqlite::Connection;
 
+use classify::Section;
 use cli::{Cli, Commands, ConfigAction, FetchArgs, SourceAction, TopicAction, UpdateArgs};
 use config::Config;
 use digest::{digest_filename, preview_digest_note, write_digest_note, DigestRun, SourceGroup};
@@ -109,9 +110,8 @@ fn resolve_fetch_params(args: &FetchArgs, settings: &settings::Settings) -> Reso
 /// exact duplicates (e.g. `--source rust,rust`, or a source named by both
 /// `--source` and a `--topic` it belongs to) before it drives a fetch loop
 /// -- both to avoid a wasted duplicate network fetch and, more importantly,
-/// to avoid two `SourceGroup`s resolving to the same `source_id` later in
-/// `handle_fetch` (see the `source_ids`/`groups` comment there for why that
-/// matters).
+/// to avoid `fetch_one_source` running (and recording seen/fetch-history
+/// rows) for the same source twice in one run.
 fn dedup_preserving_order(items: &[String]) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
     items
@@ -196,14 +196,38 @@ fn reddit_pre_request_delay(base: Duration, pressure: u32) -> Duration {
 /// Outcome of fetching one saved source label, as aggregated by
 /// `fetch_one_source`'s caller in the two-pass coordinator below (bd issue
 /// drip-6xz). Keeps the per-source fetch body (lookup, throttle, `rss::fetch`,
-/// dedup, bookkeeping) written exactly once even though it now runs across
-/// up to two passes.
+/// dedup, classify, bookkeeping) written exactly once even though it now
+/// runs across up to two passes.
 enum SourceResult {
-    /// Fetched successfully (possibly zero new items after dedup).
+    /// Fetched successfully (possibly zero routed items after classification
+    /// and per-source `--limit` truncation).
     Fetched {
         group: SourceGroup,
-        items: Vec<Item>,
         source_id: i64,
+        /// This source's contribution to `DigestRun::items_by_subtopic`:
+        /// one entry per `(main topic, sub-topic)` it routed at least one
+        /// (post-truncation) item into (bd issue drip-98u.5/drip-ho5.6's
+        /// "late fan-out" -- classification happens once per source here,
+        /// producing section buckets PLUS the `routed_items` set below, both
+        /// from the SAME classification pass).
+        sections: Vec<(Section, Vec<Item>)>,
+        /// The distinct items that landed in at least one section, after
+        /// `--limit` truncation (bd issue drip-98u.4: the cap applies to the
+        /// routed set, not the raw fetch, and runs LAST in the per-source
+        /// pipeline -- see this function's own doc comment). This is exactly
+        /// what gets `record_seen`'d and counted in `fetch_run_sources.item_count`
+        /// -- one call, one row, per source, by construction (bd issue
+        /// drip-98u.5: "this makes the confirmed fetch_run_sources PRIMARY
+        /// KEY crash impossible").
+        routed_items: Vec<Item>,
+        /// Items that matched zero candidate sub-topics (bd issue
+        /// drip-98u.3's "zero-match drop" outcome) -- reported, never
+        /// recorded seen.
+        dropped_count: usize,
+        /// Items rejected by the source-level, title-only exclude pre-filter
+        /// before any candidate routing ran (bd issue drip-98u.3's "source
+        /// exclude" outcome) -- reported, never recorded seen.
+        excluded_count: usize,
     },
     /// Still HTTP 429 after exhausting inline retries -- eligible for the
     /// final retry pass.
@@ -212,16 +236,33 @@ enum SourceResult {
     Skipped,
 }
 
-/// Fetch one saved source label: look it up, apply reddit pre-request
-/// spacing/throttle bookkeeping, call `rss::fetch`, and (on success) dedup
-/// against `seen_items` and print the same "fetched N (M new)" line the
-/// single-pass loop always has. Shared verbatim by both passes of the
-/// two-pass coordinator in `handle_fetch` so a rate-limited source retried
-/// in pass 2 goes through identical logic to pass 1 (bd issue drip-6xz).
+/// Fetch one saved source label and run it through the full per-source
+/// pipeline (bd issue drip-98u.4/drip-98u.5, implemented by drip-ho5.6):
 ///
-/// `made_request`/`pressure` are threaded through by the caller (not stored
-/// here) because they need to persist across BOTH passes and across every
-/// source within a pass, not reset per-call.
+///     fetch -> filter_unseen -> classify (source exclude pre-filter,
+///              then candidate routing) -> truncate_to_limit
+///
+/// `truncate_to_limit` runs LAST, against the classified **routed set**
+/// (distinct items that landed in at least one section) -- not the raw
+/// fetch. Moving it here (rather than right after `fetch`, as it used to
+/// run) was measured, not a style preference: truncating first can leave
+/// zero routed items at the shipped default limit, since a source's
+/// noisiest items often sort first (see `main.rs`'s own module docs / bd
+/// issue drip-98u.4's resolution for the measurement).
+///
+/// `requested_sub_topic_ids`, when `Some`, restricts classification to only
+/// the caller's requested sub-topics' rules (bd issue drip-98u.3) -- set by
+/// the caller when this label was resolved via one or more `--topic` names
+/// and never named directly via `--source`/`--all`; `None` means no topic
+/// scoping was requested, so every one of the source's own `topic_links`
+/// rows is a candidate.
+///
+/// Shared verbatim by both passes of the two-pass coordinator in
+/// `handle_fetch` so a rate-limited source retried in pass 2 goes through
+/// identical logic to pass 1 (bd issue drip-6xz). `made_request`/`pressure`
+/// are threaded through by the caller (not stored here) because they need to
+/// persist across BOTH passes and across every source within a pass, not
+/// reset per-call.
 #[allow(clippy::too_many_arguments)]
 fn fetch_one_source(
     conn: &Connection,
@@ -233,6 +274,7 @@ fn fetch_one_source(
     retry_base: Duration,
     pressure: u32,
     made_request: &mut bool,
+    requested_sub_topic_ids: Option<&[i64]>,
 ) -> SourceResult {
     let source_row = match sources::find_by_label(conn, label) {
         Ok(Some(row)) => row,
@@ -273,45 +315,98 @@ fn fetch_one_source(
 
     match outcome {
         rss::FetchOutcome::Fetched(items) => {
-            let items = truncate_to_limit(items, limit);
             let total = items.len();
-            let filtered = match dedup::filter_unseen(conn, source_row.id, items) {
-                Ok(filtered) => filtered,
+            let unseen = match dedup::filter_unseen(conn, source_row.id, items) {
+                Ok(unseen) => unseen,
                 Err(err) => {
                     eprintln!("warning: {label}: {err}");
                     return SourceResult::Skipped;
                 }
             };
-            let new = filtered.len();
-            let skipped = total - new;
+            let new_count = unseen.len();
+            let skipped = total - new_count;
 
-            if skipped > 0 {
-                println!("{label}: fetched {total} item(s), {new} new ({skipped} already seen)");
-            } else {
-                println!("{label}: fetched {new} item(s)");
+            let source_excludes = match sources::source_excludes(conn, source_row.id) {
+                Ok(terms) => terms,
+                Err(err) => {
+                    eprintln!("warning: {label}: failed to load source excludes: {err}");
+                    return SourceResult::Skipped;
+                }
+            };
+            let candidates =
+                match topics::candidates_for_source(conn, source_row.id, requested_sub_topic_ids) {
+                    Ok(candidates) => candidates,
+                    Err(err) => {
+                        eprintln!("warning: {label}: failed to load classification rules: {err}");
+                        return SourceResult::Skipped;
+                    }
+                };
+
+            // Classify BEFORE truncating (bd issue drip-98u.4) -- cloned
+            // because `unseen` is also needed afterwards, in its original
+            // feed order, to compute the routed set's feed-order truncation
+            // below.
+            let classify_result =
+                classify::classify_items(unseen.clone(), &source_excludes, &candidates);
+
+            let routed_in_feed_order: Vec<Item> = unseen
+                .into_iter()
+                .filter(|it| classify_result.routed_ids.contains(&it.id))
+                .collect();
+            let routed_items = truncate_to_limit(routed_in_feed_order, limit);
+            let truncated_ids: std::collections::HashSet<&str> =
+                routed_items.iter().map(|it| it.id.as_str()).collect();
+
+            // Build this source's section contributions from the SAME
+            // classification pass, filtered down to the (possibly smaller,
+            // post-`--limit`) truncated routed set -- an item dropped by
+            // truncation is dropped from every section it would have
+            // rendered under, not just some of them. Iterates `candidates`
+            // (not `classify_result.sections` directly) purely for a
+            // deterministic, DB-query-ordered section sequence.
+            let mut sections: Vec<(Section, Vec<Item>)> = Vec::new();
+            for candidate in &candidates {
+                if let Some(items) = classify_result.sections.get(&candidate.section) {
+                    let filtered: Vec<Item> = items
+                        .iter()
+                        .filter(|it| truncated_ids.contains(it.id.as_str()))
+                        .cloned()
+                        .collect();
+                    if !filtered.is_empty() {
+                        sections.push((candidate.section.clone(), filtered));
+                    }
+                }
             }
 
-            // `SourceRow` no longer carries a topic (bd issue drip-ho5.3 --
-            // a source can now link into more than one sub-topic, so the
-            // single-topic assumption `SourceGroup.topic` encodes is
-            // unrepresentable on the source itself). Derive it from the
-            // source's linked sub-topic(s) as an interim measure; this whole
-            // field goes away once per-item keyword classification replaces
-            // grouping-by-source's-one-topic (bd issue drip-98u.5).
-            let topic = sources::topic_names_for_source(conn, source_row.id)
-                .unwrap_or_default()
-                .into_iter()
-                .next()
-                .unwrap_or_else(|| "Uncategorized".to_string());
+            let dropped_count = classify_result.dropped_count();
+            let excluded_count = classify_result.excluded_count();
+            let routed = routed_items.len();
+
+            if skipped > 0 {
+                println!(
+                    "{label}: fetched {total} item(s), {new_count} new ({skipped} already seen), \
+                     {routed} routed ({dropped_count} dropped, {excluded_count} excluded)"
+                );
+            } else {
+                println!(
+                    "{label}: fetched {new_count} item(s), {routed} routed ({dropped_count} \
+                     dropped, {excluded_count} excluded)"
+                );
+            }
+            for dropped in &classify_result.dropped {
+                vprintln(verbose, format!("  dropped: {}", dropped.title));
+            }
 
             SourceResult::Fetched {
                 group: SourceGroup {
                     kind: source_row.kind,
                     name: label.to_string(),
-                    topic,
                 },
-                items: filtered,
                 source_id: source_row.id,
+                sections,
+                routed_items,
+                dropped_count,
+                excluded_count,
             }
         }
         rss::FetchOutcome::RateLimited => {
@@ -326,6 +421,83 @@ fn fetch_one_source(
             SourceResult::Skipped
         }
     }
+}
+
+/// Merge `section`'s `items` into `acc`, extending an already-present entry
+/// for the same `Section` (from an earlier source in this run) rather than
+/// pushing a second, duplicate entry -- so two different sources that both
+/// route into e.g. `(AI engineering, hooks)` end up under ONE `### hooks`
+/// heading, not two (bd issue drip-98u.5/drip-ho5.6).
+fn merge_section_items(acc: &mut Vec<(Section, Vec<Item>)>, section: Section, items: Vec<Item>) {
+    if let Some((_, existing)) = acc.iter_mut().find(|(s, _)| *s == section) {
+        existing.extend(items);
+    } else {
+        acc.push((section, items));
+    }
+}
+
+/// Resolve, for each label in a `drip fetch` invocation, the sub-topic ids
+/// classification should be RESTRICTED to (bd issue drip-98u.3's "candidate
+/// set = only the requested sub-topics' rules" decision).
+///
+/// `None` for a label means no topic scoping was requested for it -- it was
+/// named directly via `--source` or expanded via `--all` -- so
+/// `fetch_one_source` classifies against every one of that source's own
+/// `topic_links` rows. `Some(ids)` means the label was resolved ONLY via one
+/// or more `--topic` names, restricted to the union of those names'
+/// requested sub-topic ids (via `topics::requested_sub_topic_ids`); naming
+/// the SAME label directly via `--source`/`--all` overrides this to
+/// unrestricted, since an explicit `--source <label>` reads as "give me
+/// everything this source can classify into", not scoped to whatever topic
+/// also happens to link it.
+///
+/// Errors resolving a `--topic` name are swallowed here (as "no restriction
+/// contribution from this topic") rather than duplicating a warning --
+/// `resolve_topic_labels` already reports any unknown `--topic` name to the
+/// user.
+fn resolve_label_restrictions(
+    conn: &Connection,
+    source_labels: &[String],
+    topic_names: &[String],
+    all_labels: &[String],
+) -> std::collections::HashMap<String, Option<Vec<i64>>> {
+    let mut restrictions: std::collections::HashMap<String, Option<Vec<i64>>> =
+        std::collections::HashMap::new();
+
+    for topic_name in topic_names {
+        let Ok(ids) = topics::requested_sub_topic_ids(conn, topic_name) else {
+            continue;
+        };
+        let Ok(members) = topics::sources_for_topic(conn, topic_name) else {
+            continue;
+        };
+        for member in members {
+            let Some(label) = member.display_name else {
+                continue;
+            };
+            restrictions
+                .entry(label)
+                .and_modify(|existing| {
+                    if let Some(set) = existing {
+                        for id in &ids {
+                            if !set.contains(id) {
+                                set.push(*id);
+                            }
+                        }
+                    }
+                })
+                .or_insert_with(|| Some(ids.clone()));
+        }
+    }
+
+    for label in source_labels {
+        restrictions.insert(label.clone(), None);
+    }
+    for label in all_labels {
+        restrictions.insert(label.clone(), None);
+    }
+
+    restrictions
 }
 
 fn handle_fetch(args: &FetchArgs, config: &Config) -> Result<()> {
@@ -370,6 +542,12 @@ fn handle_fetch(args: &FetchArgs, config: &Config) -> Result<()> {
     // into, rather than a separate pipeline. The dedup guard right below
     // already handles overlap with `--source`/`--topic`, so a source named
     // both ways is still fetched exactly once.
+    // Labels added via `--all`, tracked separately from `combined_labels`
+    // (bd issue drip-l4o's own resolution is unaffected -- this is purely so
+    // `resolve_label_restrictions` below knows which labels came from `--all`
+    // specifically, since those are unrestricted just like a direct
+    // `--source`).
+    let mut all_labels: Vec<String> = Vec::new();
     if args.all {
         let all_sources = sources::list(&conn)?;
         if all_sources.is_empty() {
@@ -380,7 +558,8 @@ fn handle_fetch(args: &FetchArgs, config: &Config) -> Result<()> {
         }
         for row in all_sources {
             if let Some(label) = row.display_name {
-                combined_labels.push(label);
+                combined_labels.push(label.clone());
+                all_labels.push(label);
             }
         }
     }
@@ -393,18 +572,43 @@ fn handle_fetch(args: &FetchArgs, config: &Config) -> Result<()> {
     // `PRIMARY KEY(fetch_run_id, source_id)` insert further down.
     let sources_to_fetch = dedup_preserving_order(&combined_labels);
 
-    // `groups`/`source_ids` are shared across the fetch loop below.
-    // `source_ids` is keyed by `(kind, name)` rather than bare `name` so
-    // sources of different kinds that happen to share the same label string
-    // resolve to genuinely distinct keys and never collide -- a bare-`name`
-    // key previously let one silently overwrite the other's `source_id` in
-    // this map, corrupting which source's `seen_items`/`fetch_run_sources`
-    // rows the other group's items got attributed to. Exact duplicates
-    // within `args.source` are handled separately, by deduplicating it up
-    // front via `dedup_preserving_order` before the fetch loop runs below.
-    let mut groups: Vec<(SourceGroup, Vec<Item>)> = Vec::new();
-    let mut source_ids: std::collections::HashMap<(SourceKind, String), i64> =
-        std::collections::HashMap::new();
+    // Which sub-topics classification should be RESTRICTED to, per label (bd
+    // issue drip-98u.3) -- see `resolve_label_restrictions`'s own doc comment.
+    let restrictions = resolve_label_restrictions(&conn, &args.source, &args.topic, &all_labels);
+    let restriction_for =
+        |label: &str| -> Option<&[i64]> { restrictions.get(label).and_then(|r| r.as_deref()) };
+
+    // Accumulators shared across the fetch loop below (bd issue drip-98u.5's
+    // "late fan-out": the pipeline stays keyed per source right up to this
+    // point -- `fetch_one_source` classifies once per source and returns
+    // BOTH its section contributions and its routed set in one shot, so
+    // every per-source consumer below (`sources_seen`, `per_source`,
+    // `seen_to_record`) gets exactly one entry per source, by construction).
+    let mut sources_seen: Vec<SourceGroup> = Vec::new();
+    let mut items_by_subtopic: Vec<(Section, Vec<Item>)> = Vec::new();
+    let mut per_source: Vec<(i64, usize)> = Vec::new();
+    let mut seen_to_record: Vec<(i64, Vec<Item>)> = Vec::new();
+    let mut total_new_posts: usize = 0;
+    let mut total_dropped: usize = 0;
+    let mut total_excluded: usize = 0;
+
+    let mut record_fetched = |group: SourceGroup,
+                              source_id: i64,
+                              sections: Vec<(Section, Vec<Item>)>,
+                              routed_items: Vec<Item>,
+                              dropped_count: usize,
+                              excluded_count: usize| {
+        sources_seen.push(group);
+        for (section, items) in sections {
+            merge_section_items(&mut items_by_subtopic, section, items);
+        }
+        per_source.push((source_id, routed_items.len()));
+        total_new_posts += routed_items.len();
+        total_dropped += dropped_count;
+        total_excluded += excluded_count;
+        seen_to_record.push((source_id, routed_items));
+    };
+
     // Tracks whether a network fetch has already happened THIS run (across
     // BOTH passes), so the reddit throttle below never delays the very
     // first fetch (nothing to space out from yet) -- only requests after
@@ -436,15 +640,23 @@ fn handle_fetch(args: &FetchArgs, config: &Config) -> Result<()> {
             retry_base,
             pressure,
             &mut made_request,
+            restriction_for(label),
         ) {
             SourceResult::Fetched {
                 group,
-                items,
                 source_id,
-            } => {
-                source_ids.insert((group.kind, group.name.clone()), source_id);
-                groups.push((group, items));
-            }
+                sections,
+                routed_items,
+                dropped_count,
+                excluded_count,
+            } => record_fetched(
+                group,
+                source_id,
+                sections,
+                routed_items,
+                dropped_count,
+                excluded_count,
+            ),
             SourceResult::RateLimited => {
                 pressure = (pressure + 1).min(8);
                 rate_limited.push(label.clone());
@@ -479,15 +691,23 @@ fn handle_fetch(args: &FetchArgs, config: &Config) -> Result<()> {
                 retry_base,
                 pressure,
                 &mut made_request,
+                restriction_for(label),
             ) {
                 SourceResult::Fetched {
                     group,
-                    items,
                     source_id,
-                } => {
-                    source_ids.insert((group.kind, group.name.clone()), source_id);
-                    groups.push((group, items));
-                }
+                    sections,
+                    routed_items,
+                    dropped_count,
+                    excluded_count,
+                } => record_fetched(
+                    group,
+                    source_id,
+                    sections,
+                    routed_items,
+                    dropped_count,
+                    excluded_count,
+                ),
                 SourceResult::RateLimited => {
                     pressure = (pressure + 1).min(8);
                     rate_limited.push(label.clone());
@@ -504,26 +724,22 @@ fn handle_fetch(args: &FetchArgs, config: &Config) -> Result<()> {
         }
     }
 
-    if groups.is_empty() {
+    if sources_seen.is_empty() {
         eprintln!("drip fetch: no sources fetched successfully; nothing to write");
         return Ok(());
     }
 
-    // Computed before `groups` is moved into `DigestRun` below -- only
-    // borrows, so it must be taken before the move, not necessarily adjacent
-    // to it. Feeds `fetch_runs::record`'s per-source breakdown (drip-
-    // 15n.9.5) on every outcome below, including the zero-new-items and
-    // `--dry-run` cases.
-    let per_source: Vec<(i64, usize)> = groups
-        .iter()
-        .filter_map(|(group, items)| {
-            source_ids
-                .get(&(group.kind, group.name.clone()))
-                .map(|&id| (id, items.len()))
-        })
-        .collect();
+    // Report the run's dropped/excluded totals (bd issue drip-98u.3/
+    // drip-ho5.6) -- the per-source lines above already broke this down
+    // per-label; this is the whole-run summary. `-v` additionally lists each
+    // dropped item's title (printed per-source, above, via `vprintln`).
+    if total_dropped > 0 || total_excluded > 0 {
+        println!(
+            "drip fetch: {total_dropped} item(s) dropped (matched no sub-topic), \
+             {total_excluded} item(s) excluded (source-level pre-filter)"
+        );
+    }
 
-    let total_new_posts: usize = groups.iter().map(|(_, items)| items.len()).sum();
     if total_new_posts == 0 {
         fetch_runs::record(&conn, None, 0, &per_source)?;
         println!("drip fetch: no new posts found; nothing to write");
@@ -535,7 +751,8 @@ fn handle_fetch(args: &FetchArgs, config: &Config) -> Result<()> {
         time: resolved.time,
         query: resolved.query.clone(),
         tags: resolved.tag.clone(),
-        items_by_source: groups,
+        items_by_subtopic,
+        sources: sources_seen,
         created_at: chrono::Utc::now(),
     };
 
@@ -554,12 +771,8 @@ fn handle_fetch(args: &FetchArgs, config: &Config) -> Result<()> {
         } else {
             let filename = digest_filename(&run);
             let digest_basename = filename.trim_end_matches(".md");
-            let post_count: usize = run
-                .items_by_source
-                .iter()
-                .map(|(_, items)| items.len())
-                .sum();
-            let bullet = journal::digest_bullet(digest_basename, &run.source_groups(), post_count);
+            let bullet =
+                journal::digest_bullet(digest_basename, &run.source_groups(), total_new_posts);
             let daily_path = journal::daily_note_path(
                 &config.vault_path,
                 &settings.daily_notes_folder,
@@ -588,11 +801,11 @@ fn handle_fetch(args: &FetchArgs, config: &Config) -> Result<()> {
     // 15n.9.4), so a future fetch doesn't re-surface it. Deliberately placed
     // only on this non-dry-run path -- `--dry-run` returns above and never
     // reaches here -- and deliberately independent of `--no-journal`, since
-    // this is about the digest note, not the journal.
-    for (group, items) in &run.items_by_source {
-        if let Some(source_id) = source_ids.get(&(group.kind, group.name.clone())) {
-            dedup::record_seen(&conn, *source_id, items)?;
-        }
+    // this is about the digest note, not the journal. Exactly ONE call per
+    // source (bd issue drip-98u.5), with that source's full routed set --
+    // "recorded seen IFF written to a digest" (bd issue drip-98u.3).
+    for (source_id, items) in &seen_to_record {
+        dedup::record_seen(&conn, *source_id, items)?;
     }
 
     // Record this fetch run's history (drip-15n.9.5) -- a real file was
@@ -612,11 +825,6 @@ fn handle_fetch(args: &FetchArgs, config: &Config) -> Result<()> {
             .and_then(|s| s.to_str())
             .unwrap_or_default()
             .to_string();
-        let post_count: usize = run
-            .items_by_source
-            .iter()
-            .map(|(_, items)| items.len())
-            .sum();
 
         let daily_path = journal::ensure_daily_note(
             &config.vault_path,
@@ -627,7 +835,7 @@ fn handle_fetch(args: &FetchArgs, config: &Config) -> Result<()> {
             &daily_path,
             &digest_basename,
             &run.source_groups(),
-            post_count,
+            total_new_posts,
         )?;
         println!("drip fetch: updated daily note at {}", daily_path.display());
     }
@@ -1985,6 +2193,157 @@ mod tests {
         // Sanity: the other topic members still made it in too.
         assert!(note.contains("Post from b"));
         assert!(note.contains("Post from c"));
+    }
+
+    // -- bd issue drip-ho5.6: late fan-out crash-prevention test. Confirms
+    // the pipeline reshape makes the previously-confirmed
+    // `fetch_run_sources` PRIMARY KEY(fetch_run_id, source_id) crash
+    // impossible: a single source linked into TWO sub-topics (so its one
+    // item multi-matches into both, per bd issue drip-98u.3's "no
+    // precedence" decision) must still produce exactly ONE
+    // `fetch_run_sources` row, not two.
+
+    #[test]
+    fn a_source_feeding_two_subtopics_does_not_panic_and_records_exactly_one_fetch_run_sources_row()
+    {
+        let (_db_dir, vault_dir, config) = fresh_config_with_vault();
+        let mut server = mockito::Server::new();
+
+        let source_id = {
+            let conn = db::open(&config).unwrap();
+            // `register_mocked_rss_source` links "a" into a ruleless link
+            // under "Uncategorized" -- an empty include list matches every
+            // item (`RuleSet::matches`), so a SECOND ruleless link into a
+            // different sub-topic guarantees this source's one fetched item
+            // multi-matches into both, without needing real keyword rules.
+            register_mocked_rss_source(&conn, &mut server, "a");
+            let second_topic_id = topics::create_topic(&conn, "second").unwrap();
+            let source_id = sources::find_by_label(&conn, "a").unwrap().unwrap().id;
+            conn.execute(
+                "INSERT INTO topic_links (source_id, topic_id) VALUES (?1, ?2)",
+                rusqlite::params![source_id, second_topic_id],
+            )
+            .expect("second topic_links insert should succeed");
+            source_id
+        };
+
+        handle_fetch(&fetch_args(&["a"]), &config)
+            .expect("fetch of a source multi-matching into two sub-topics must not panic");
+
+        // The multi-match rendered in both sub-topics' sections (sanity: the
+        // fan-out actually happened, this isn't a vacuously-passing test).
+        let note = read_only_digest_note(vault_dir.path());
+        assert_eq!(
+            note.matches("Post from a").count(),
+            2,
+            "the source's one item should render under BOTH sub-topics it's \
+             linked into:\n{note}"
+        );
+
+        // The crash this test guards against: `per_source` (and therefore
+        // `fetch_run_sources`, PRIMARY KEY(fetch_run_id, source_id)) must
+        // carry exactly one row for this source, not one per section it fed.
+        let conn = db::open(&config).unwrap();
+        let row_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM fetch_run_sources WHERE source_id = ?1",
+                rusqlite::params![source_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            row_count, 1,
+            "exactly one fetch_run_sources row per source, regardless of how \
+             many sub-topics it fed"
+        );
+
+        let item_count: i64 = conn
+            .query_row(
+                "SELECT item_count FROM fetch_run_sources WHERE source_id = ?1",
+                rusqlite::params![source_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            item_count, 1,
+            "item_count should be the source's DISTINCT routed-item count \
+             (1), not the sum across the two sections it multi-matched into (2)"
+        );
+    }
+
+    // -- bd issue drip-98u.3: "candidates are only the REQUESTED sub-topics'
+    // rules" -- `drip fetch --topic <name>` must classify against ONLY the
+    // rules of the sub-topic(s) `<name>` resolves to, even though the
+    // fetched source is also linked into other sub-topics with their own
+    // (here, more permissive) rules.
+
+    #[test]
+    fn fetch_via_topic_restricts_classification_to_only_that_topics_rules() {
+        let (_db_dir, vault_dir, config) = fresh_config_with_vault();
+        let mut server = mockito::Server::new();
+
+        {
+            let conn = db::open(&config).unwrap();
+            // `register_mocked_rss_source` links "a" into a RULELESS
+            // "Uncategorized" link -- an empty include list matches
+            // everything, so this is the "wide" link.
+            register_mocked_rss_source(&conn, &mut server, "a");
+            let source_id = sources::find_by_label(&conn, "a").unwrap().unwrap().id;
+
+            // A second, "narrow" sub-topic with a real keyword rule that the
+            // fixture's fetched item ("Post from a") does NOT satisfy.
+            let narrow_topic_id = topics::create_topic(&conn, "narrow").unwrap();
+            conn.execute(
+                "INSERT INTO topic_links (source_id, topic_id) VALUES (?1, ?2)",
+                rusqlite::params![source_id, narrow_topic_id],
+            )
+            .unwrap();
+            let link_id: i64 = conn
+                .query_row(
+                    "SELECT id FROM topic_links WHERE source_id = ?1 AND topic_id = ?2",
+                    rusqlite::params![source_id, narrow_topic_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            conn.execute(
+                "INSERT INTO link_rules (link_id, role, term) VALUES (?1, 'include', 'quantum')",
+                rusqlite::params![link_id],
+            )
+            .unwrap();
+        }
+
+        // `--topic narrow` must restrict classification to ONLY "narrow"'s
+        // rule -- the wide, ruleless "Uncategorized" link must not also be
+        // consulted just because the same source happens to be linked into
+        // it too. The item fails "narrow"'s "quantum" rule, so nothing
+        // should be routed, and no digest note should be written.
+        handle_fetch(&fetch_args_with_topics(&[], &["narrow"]), &config)
+            .expect("fetch with --topic should succeed even when nothing routes");
+
+        let posts_dir = vault_dir.path().join("Resources/Reddit");
+        let wrote_nothing = !posts_dir.exists()
+            || std::fs::read_dir(&posts_dir)
+                .expect("failed to read posts dir")
+                .next()
+                .is_none();
+        assert!(
+            wrote_nothing,
+            "restricted to 'narrow', the item should match nothing and \
+             write no digest note"
+        );
+
+        // A direct `--source a` fetch (no topic scoping requested) must
+        // classify against EVERY one of the source's links, including the
+        // wide, ruleless one -- and route successfully.
+        handle_fetch(&fetch_args(&["a"]), &config)
+            .expect("direct --source fetch should succeed and route via the unrestricted link");
+
+        let note = read_only_digest_note(vault_dir.path());
+        assert!(
+            note.contains("Post from a"),
+            "unrestricted --source fetch should route via the wide, \
+             ruleless link:\n{note}"
+        );
     }
 
     #[test]

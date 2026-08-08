@@ -81,9 +81,11 @@ pub fn ensure_daily_note(
 ///
 /// Named source-kind-neutrally (rather than `reddit_bullet`) since a digest
 /// can include non-Reddit source groups too (see bd issue drip-15n.9.6):
-/// each group's label is rendered via [`SourceKind::heading_prefix`], the
-/// same centralized decision point `src/digest.rs` uses for its own
-/// heading/`**Subreddits:**` rendering (bd issue drip-p6v.4).
+/// each group's bare display label is used directly, with no `r/` prefix
+/// (bd issue drip-98u.12 removed `SourceKind::heading_prefix`'s `r/{name}`
+/// convention entirely, since it prefixed a source's *label* rather than its
+/// actual subreddit, which could be misleading for a search-scoped label
+/// like `cc-hooks`).
 pub fn digest_bullet(
     digest_note_basename: &str,
     groups: &[SourceGroup],
@@ -91,7 +93,7 @@ pub fn digest_bullet(
 ) -> String {
     let source_labels = groups
         .iter()
-        .map(|group| group.kind.heading_prefix(&group.name))
+        .map(|group| group.name.clone())
         .collect::<Vec<_>>()
         .join(", ");
     format!("- [[{digest_note_basename}]] — {post_count} posts from {source_labels}")
@@ -205,7 +207,6 @@ mod tests {
         SourceGroup {
             kind: SourceKind::Reddit,
             name: name.to_string(),
-            topic: "Programming".to_string(),
         }
     }
 
@@ -273,7 +274,7 @@ mod tests {
 
         let content = fs::read_to_string(&path).unwrap();
         assert!(content.contains(
-            "## Reddit\n\n- [[2026-07-08 0900 - Reddit digest (rust)]] — 3 posts from r/rust\n"
+            "## Reddit\n\n- [[2026-07-08 0900 - Reddit digest (rust)]] — 3 posts from rust\n"
         ));
         // Only one heading, no duplicates.
         assert_eq!(content.matches("## Reddit").count(), 1);
@@ -303,7 +304,9 @@ mod tests {
         // stray content between them.
         let reddit_idx = content.find("## Reddit").unwrap();
         let section = &content[reddit_idx..];
-        assert!(section.contains("- [[old digest]] — 5 posts from r/rust\n- [[new digest]] — 2 posts from r/programming\n"));
+        assert!(section.contains(
+            "- [[old digest]] — 5 posts from r/rust\n- [[new digest]] — 2 posts from programming\n"
+        ));
     }
 
     #[test]
@@ -375,8 +378,8 @@ mod tests {
 
         let content = fs::read_to_string(&path).unwrap();
         assert_eq!(content.matches("## Reddit").count(), 1);
-        assert!(content.contains("- [[digest one]] — 3 posts from r/rust"));
-        assert!(content.contains("- [[digest two]] — 4 posts from r/programming"));
+        assert!(content.contains("- [[digest one]] — 3 posts from rust"));
+        assert!(content.contains("- [[digest two]] — 4 posts from programming"));
 
         let first_pos = content.find("- [[digest one]]").unwrap();
         let second_pos = content.find("- [[digest two]]").unwrap();
@@ -384,19 +387,27 @@ mod tests {
     }
 
     #[test]
-    fn digest_bullet_renders_non_reddit_groups_without_the_r_prefix() {
+    fn digest_bullet_renders_every_group_kind_without_the_r_prefix() {
+        // bd issue drip-98u.12: `SourceKind::heading_prefix`'s `r/{name}`
+        // convention is gone entirely -- ADAPTED from the original
+        // "non-reddit groups don't get the prefix" premise (now trivially
+        // true of every kind, reddit included, since there's no prefixing
+        // code path left at all).
         let rss_group = SourceGroup {
             kind: SourceKind::Rss,
             name: "rust-blog".to_string(),
-            topic: "Programming".to_string(),
+        };
+        let reddit_group = SourceGroup {
+            kind: SourceKind::Reddit,
+            name: "cc-hooks".to_string(),
         };
 
-        let bullet = digest_bullet("digest", &[rss_group], 2);
+        let bullet = digest_bullet("digest", &[rss_group, reddit_group], 2);
 
-        assert!(bullet.contains("rust-blog"));
+        assert!(bullet.contains("rust-blog") && bullet.contains("cc-hooks"));
         assert!(
-            !bullet.contains("r/rust-blog"),
-            "non-reddit groups must not get the r/ prefix: {bullet}"
+            !bullet.contains("r/rust-blog") && !bullet.contains("r/cc-hooks"),
+            "no group kind should ever get an r/ prefix: {bullet}"
         );
     }
 }
