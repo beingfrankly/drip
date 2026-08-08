@@ -146,8 +146,8 @@ impl DigestRun {
         let mut seen = HashSet::new();
         self.tags
             .iter()
+            .filter(|&t| seen.insert(t.clone()))
             .cloned()
-            .filter(|t| seen.insert(t.clone()))
             .collect()
     }
 }
